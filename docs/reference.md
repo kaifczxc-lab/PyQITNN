@@ -243,7 +243,7 @@ vx, vy = v[..., :D//2], v[..., D//2:]
 Attention scores use both channels:
 
 ```
-score[i,j] = (qx[i] . kx[j] + qy[i] . ky[j]) / sqrt(D//2)
+score[i,j] = (qx[i] . kx[j] + qy[i] . ky[j]) / sqrt(D)
 ```
 
 with causal masking (j > i -> -inf) and softmax normalization.
@@ -761,7 +761,7 @@ Called automatically when the package is imported (`import pyqitnn`).
 
 On Windows, uses `os.add_dll_directory()` to register:
 - The Torch `lib/` directory (contains cublas, cudnn, etc.)
-- The CUDA Toolkit `bin/` directory
+- The CUDA Toolkit `bin/x64/` directory when present (falls back to `bin/`)
 
 On Linux, prepends to `PATH` and `LD_LIBRARY_PATH`.
 
@@ -769,8 +769,8 @@ Returns a dict with the resolved paths:
 
 ```python
 {
-    "torch_lib_dir": "C:/Python313/Lib/site-packages/torch/lib",
-    "cuda_bin_dir": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin",
+    "torch_lib_dir": ".../site-packages/torch/lib",
+    "cuda_bin_dir": "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.1/bin/x64",
 }
 ```
 
@@ -797,7 +797,8 @@ If `native_found` is True but `native_loadable` is False, check `load_error` --
 common causes are CUDA version mismatch or missing DLLs.
 
 If `native_found` is False, the CUDA extension was not compiled. Re-run
-`pip install .` from the `torch_bridge/` directory.
+`build_win.bat` from a repo checkout, or `pip install .` from the `torch_bridge/`
+directory.
 
 ---
 
@@ -865,7 +866,7 @@ result = train(
 | `best_val` | float or None | Best validation loss seen during training. |
 | `test_loss` | float or None | Test loss evaluated at the end (only if `test_dir` was provided with `extended_dataset=True`). |
 | `run_dir` | str or None | Path to the run directory with checkpoints and logs. None if `no_save=True`. |
-| `model` | QITNNSimplexTransformerLM | The trained model (on GPU, in eval-ready state). |
+| `model` | QITNNSimplexTransformerLM | The trained model instance on GPU. It is returned as-is; call `model.eval()` yourself before inference if you want eval mode. |
 
 ### Usage from CLI
 
@@ -901,7 +902,7 @@ and what happens when you change it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `dataset` | str or Path | `"data"` | Path to a file or directory with training data. If it's a file, that file is used directly. If it's a directory, all files inside are concatenated as raw bytes. When `extended_dataset=False` (default), the data is auto-split into train/val by `val_split_div`. |
+| `dataset` | str or Path | `r"D:\so_data\dataset.txt"` | Path to a file or directory with training data. If it's a file, that file is used directly. If it's a directory, all files inside are concatenated as raw bytes. When `extended_dataset=False` (default), the data is auto-split into train/val by `val_split_div`. |
 | `extended_dataset` | bool | `False` | Data loading mode switch. `False` = simple mode: load `dataset`, auto-split into train/val. `True` = extended mode: use `train_dir`/`val_dir`/`test_dir` separately, no auto-split. |
 | `train_dir` | str, Path, or None | `None` | Path to training data (extended mode only). If None in extended mode, falls back to `dataset`. |
 | `val_dir` | str, Path, or None | `None` | Path to validation data (extended mode only). If None in extended mode, validation is skipped (empty tensor). |
@@ -1051,7 +1052,7 @@ For long training (50+ epochs), combining both works well.
 | `temperature` | float | `0.65` | Sampling temperature. | `0.0` = greedy argmax (most deterministic). `0.5` = fairly conservative. `0.65` = good default for readable byte-level text. `1.0` = full entropy, more random. `> 1.0` = very random. |
 | `top_k` | int | `12` | Top-k sampling filter. | Only the top K most probable tokens are sampled from. `12` = conservative. `50` = more diverse. `0` = no filtering (sample from full distribution). |
 | `gen_bytes` | int | `160` | Bytes to generate per sample. | How many bytes the model generates after the prompt. |
-| `prompt` | str | `""` | Prompt text for generation. | If empty, a random slice from training data is used as prompt. If set, this text (encoded as UTF-8) is the prompt. |
+| `prompt` | str | `""` | Prompt text for generation. | If empty, the first `prompt_bytes` bytes of training data are used as the prompt. If set, this text (encoded as UTF-8) is the prompt. |
 | `prompt_bytes` | int | `64` | Max bytes from the prompt. | Truncates the prompt to this many bytes before feeding to the model. |
 | `gen_every` | int | `0` | Generate a sample every N epochs. | `0` = only generate at the end. `5` = generate every 5 epochs (useful for monitoring quality during training). |
 
@@ -1251,17 +1252,9 @@ For training, remember to:
 
 ## Test suite
 
-The package includes two test files that verify correctness:
+The repo currently ships one main integration test script:
 
-**test_qitnn.py** (73 tests) -- core correctness:
-- Gradient checks (finite difference vs analytic) for forward3, backnorm3
-- Output range validation (Born rule: |u|+v <= 1)
-- Symmetry, zero inputs, edge cases
-- Module training convergence
-- Deterministic forward/backward
-- cuBLAS vs torch.mm comparison
-
-**test_stress.py** (88 tests) -- stress and integration:
+**stress_test.py** -- stress and integration:
 - Born rule probability sum = 1.0
 - Simplex triangle vertex positions
 - attention2 vs PyTorch SDPA comparison
@@ -1277,7 +1270,7 @@ Run tests:
 
 ```bash
 cd torch_bridge
-python -m pytest test_qitnn.py test_stress.py -v
+python stress_test.py
 ```
 
 ---
@@ -1323,5 +1316,5 @@ python -m pytest test_qitnn.py test_stress.py -v
 | Version | Changes |
 |---------|---------|
 | 0.3.0 | Fixed AdamW per-role zero-boost bug. Fixed silent build fallback. Added CUDA-required check in QITNNLinear. Improved bridge_status() with actual load verification. Updated metadata for PyPI. Auto-detect GPU architectures in setup.py. |
-| 0.2.0 | Renamed to PyQITNN. Cross-platform support (Linux). Single-command install. Refactored ops, modules, diagnostics. Comprehensive test suite (73+88 tests). |
+| 0.2.0 | Renamed to PyQITNN. Cross-platform support (Linux). Single-command install. Refactored ops, modules, diagnostics, and testing workflow. |
 | 0.1.0 | Initial release. Windows-only. forward3, backnorm3, prior, centered_simplex, attention2. QITNNLinear module. Basic transformer. |

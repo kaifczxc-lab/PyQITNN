@@ -2,7 +2,7 @@
 Stress test for PyQITNN architecture.
 Designed to expose hidden bugs before public release.
 
-Run: python test_stress.py
+Run: python stress_test.py
 Requires CUDA GPU.
 """
 import sys
@@ -169,13 +169,22 @@ def test_centered_simplex_backward_fd():
     check(f"simplex backward v[0,0]: fd={fd:.6f} analytic={analytic:.6f} rel_err={rel_err:.4f}",
           rel_err < 0.02, f"rel_err={rel_err:.4f}")
 
-    # the key check: grad_v should be ~ sqrt(3) * grad_y
-    # since x doesn't depend on v, grad_v comes entirely from y = sqrt(3)*v - const
-    # d(loss)/dv = d(loss)/dy * dy/dv = grad_y * sqrt(3)
+    # exact Jacobian check: dx/du = 1, dy/dv = sqrt(3), and the cross terms are zero
+    u2 = torch.randn(3, 5, device=DEVICE, requires_grad=True)
+    v2 = torch.randn(3, 5, device=DEVICE, requires_grad=True)
+    gx_up = torch.randn_like(u2)
+    gy_up = torch.randn_like(v2)
+
+    x2, y2 = centered_simplex(u2, v2)
+    gu, gv = torch.autograd.grad((x2, y2), (u2, v2), grad_outputs=(gx_up, gy_up))
+
     sqrt3 = 1.7320508075688772
-    ratio = v.grad.abs().mean().item() / (sqrt3 * 0.5)  # rough scale check
-    check(f"sqrt(3) factor present in grad_v (ratio ~1.0): {ratio:.3f}",
-          0.3 < ratio < 3.0, f"ratio={ratio:.4f}")
+    err_u = (gu - gx_up).abs().max().item()
+    err_v = (gv - gy_up * sqrt3).abs().max().item()
+    check(f"simplex jacobian du identity: max_err={err_u:.2e}",
+          err_u < 1e-6, f"max_err={err_u:.2e}")
+    check(f"simplex jacobian dv sqrt(3): max_err={err_v:.2e}",
+          err_v < 1e-6, f"max_err={err_v:.2e}")
 
 
 #====================

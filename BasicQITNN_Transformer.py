@@ -56,7 +56,7 @@ class TrainConfig:
     # set this to your actual data path before running
     # right now only support .txt files, in future will be JSON
     #====================
-    dataset: str | Path = r"D:\so_data\dataset.txt"   # path to .txt file or directory with text files
+    dataset: str | Path = r"YOUR_DATASET_PATH"   # path to .txt file or directory with text files
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
