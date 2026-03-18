@@ -1,0 +1,4 @@
+include README.md
+include pyproject.toml
+recursive-include csrc *.cu *.h
+recursive-include src *.cpp
