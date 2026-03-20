@@ -862,9 +862,19 @@ result = train(
 | Key | Type | Description |
 |-----|------|-------------|
 | `first_loss` | float | Training loss of the very first step. |
+| `first_ppl` | float or None | Perplexity of the very first step (`exp(first_loss)`). |
 | `last_loss` | float | Training loss of the last step. |
+| `last_ppl` | float or None | Perplexity of the last step (`exp(last_loss)`). |
 | `best_val` | float or None | Best validation loss seen during training. |
+| `best_val_ppl` | float or None | Perplexity corresponding to `best_val`. |
 | `test_loss` | float or None | Test loss evaluated at the end (only if `test_dir` was provided with `extended_dataset=True`). |
+| `test_ppl` | float or None | Test perplexity evaluated at the end when test data is available. |
+| `last_epoch_train_loss` | float or None | Average train loss of the final epoch. |
+| `last_epoch_train_ppl` | float or None | Average train perplexity of the final epoch. |
+| `last_epoch_val_loss` | float or None | Average validation loss of the final epoch, or `None` when validation has no windows. |
+| `last_epoch_val_ppl` | float or None | Average validation perplexity of the final epoch. |
+| `last_epoch_train_tok_s` | float or None | Training throughput in tokens/sec for the final epoch. |
+| `last_epoch_val_tok_s` | float or None | Validation throughput in tokens/sec for the final epoch. |
 | `run_dir` | str or None | Path to the run directory with checkpoints and logs. None if `no_save=True`. |
 | `model` | QITNNSimplexTransformerLM | The trained model instance on GPU. It is returned as-is; call `model.eval()` yourself before inference if you want eval mode. |
 
@@ -1080,7 +1090,7 @@ For long training (50+ epochs), combining both works well.
 ```
 runs/run_20260317_143022/
   config.json        # all TrainConfig values + param count
-  metrics.csv        # epoch, train_loss, val_loss, lr, time_s
+  metrics.csv        # epoch, train_loss, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr, time_s
   ckpt_best.pt       # best model by val_loss (auto-updated)
   ckpt_ep25.pt       # periodic checkpoint
   ckpt_ep50.pt

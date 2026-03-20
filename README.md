@@ -72,6 +72,12 @@ Then install PyQITNN without allowing pip to replace your existing Torch build:
 pip install pyqitnn --no-deps
 ```
 
+If you want optional BPE/subword tokenizer support:
+
+```bash
+pip install pyqitnn[tokenizers] --no-deps
+```
+
 ### Verify
 
 ```python
@@ -155,6 +161,47 @@ output = model.generate(prompt, max_new_tokens=64, temperature=0.7, top_k=12)
 text = bytes(output[0].cpu().tolist()).decode("utf-8", errors="replace")
 print(text)
 ```
+
+### Tokenizer Modes
+
+PyQITNN's QTS math is tokenizer-agnostic. Switching from byte tokens to BPE/subword
+tokens does **not** change `forward3`, `backnorm3`, `centered_simplex`, `attention2`,
+the 2D simplex state, or the ternary/Born-rule parameterization. It only changes
+how raw text is mapped to token ids and what `vocab_size` the embedding/head use.
+
+- `byte`: built in, fixed `vocab_size=256`, no extra dependency
+- `bpe`: optional, uses HuggingFace `tokenizers`
+
+```python
+import pyqitnn
+
+bpe = pyqitnn.train_bpe_tokenizer(
+    ["hello simplex transformer", "born rule ternary attention"],
+    vocab_size=320,
+    min_frequency=1,
+)
+
+model = pyqitnn.QITNNSimplexTransformerLM(
+    vocab_size=bpe.vocab_size,
+    dim=64,
+    ffn_dim=128,
+    seq_len=128,
+    layers=2,
+    device="cuda:0",
+)
+```
+
+### Trainer data formats
+
+The training script accepts plain text as well as structured JSON corpora.
+
+- `text`: raw file contents
+- `json`: parse JSON and extract text fields
+- `jsonl` / `ndjson`: parse one JSON record per line
+- `auto`: use file extension to choose between text and JSON parsing
+
+For JSON inputs, the trainer can either collect all string leaves recursively or prefer
+specific fields such as `text,content`.
 
 ---
 
@@ -279,7 +326,8 @@ opt = torch.optim.AdamW([
 - No dropout. Regularization comes from the entropy prior.
 - No gradient checkpointing. Memory scales linearly with layers.
 - `seq_len` is fixed at construction time and cannot be changed.
-- Byte-level vocabulary (256 tokens). No BPE or subword tokenizer.
+- BPE/subword tokenization is supported at the Python/trainer layer and does not alter the QTS math path.
+- Byte mode remains the simplest baseline and the default install path.
 
 **Numerical:**
 - cuBLAS GEMM results may differ from `torch.mm` by up to about `1e-2` on large matrices.

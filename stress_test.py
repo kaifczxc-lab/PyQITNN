@@ -5,6 +5,7 @@ Designed to expose hidden bugs before public release.
 Run: python stress_test.py
 Requires CUDA GPU.
 """
+import json
 import sys
 import math
 import time
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import pyqitnn
+from BasicQITNN_Transformer import load_bytes, train
 from pyqitnn.ops import forward3, prior_, centered_simplex, attention2
 from pyqitnn.bridge import load_native
 
@@ -41,7 +43,12 @@ def warn(name, detail=""):
     WARNED += 1
     print(f"  [WARN] {name} -- {detail}")
 
+import pyqitnn
 
+status = pyqitnn.bridge_status()
+print(pyqitnn.__version__)        # e.g. 0.3.2
+print(status["native_found"])     # True
+print(status["native_loadable"])  # True
 #====================
 # 1. Born rule invariant: P- + P0 + P+ = 1.0 exactly
 #    if this fails, the normalize kernel is wrong
@@ -865,6 +872,153 @@ def test_residual_matters():
 
 
 #====================
+# 21. Byte tokenizer: current byte path must remain stable
+#====================
+
+def test_byte_tokenizer_roundtrip():
+    print("\n=== test_byte_tokenizer_roundtrip ===")
+    tok = pyqitnn.ByteTokenizer()
+    sample = "Hello, QITNN.\nByte path stays intact."
+    ids = tok.encode_text(sample)
+    decoded = tok.decode(ids)
+
+    check("byte tokenizer vocab=256", tok.vocab_size == 256, f"vocab={tok.vocab_size}")
+    check("byte tokenizer roundtrip exact", decoded == sample, f"decoded={decoded!r}")
+
+
+#====================
+# 22. BPE tokenizer: roundtrip and vocab smoke
+#====================
+
+def test_bpe_tokenizer_roundtrip():
+    print("\n=== test_bpe_tokenizer_roundtrip ===")
+    try:
+        tok = pyqitnn.train_bpe_tokenizer(
+            [
+                "hello world hello simplex transformer",
+                "born rule ternary simplex attention",
+            ],
+            vocab_size=320,
+            min_frequency=1,
+        )
+    except RuntimeError as e:
+        warn("bpe tokenizer roundtrip skipped", str(e))
+        return
+
+    sample = "hello world simplex"
+    ids = tok.encode_text(sample)
+    decoded = tok.decode(ids)
+
+    check("bpe tokenizer produced ids", len(ids) > 0, "no token ids")
+    check("bpe tokenizer vocab size", tok.vocab_size >= 256, f"vocab={tok.vocab_size}")
+    check("bpe tokenizer roundtrip exact", decoded == sample, f"decoded={decoded!r}")
+
+
+#====================
+# 23. BPE trainer smoke: end-to-end trainer path without touching QTS math
+#====================
+
+def test_bpe_trainer_smoke():
+    print("\n=== test_bpe_trainer_smoke ===")
+    tmp_path = ROOT / "_tmp_bpe_dataset.txt"
+    text = (
+        "hello simplex transformer born rule attention qitnn data stream\n"
+        "tokenizer smoke test keeps qts math unchanged and only changes token ids\n"
+    ) * 64
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="bpe",
+            tokenizer_vocab_size=320,
+            tokenizer_min_frequency=1,
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            steps=2,
+            no_save=True,
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_tokens=8,
+            gen_tokens=8,
+        )
+    except RuntimeError as e:
+        warn("bpe trainer smoke skipped", str(e))
+        tmp_path.unlink(missing_ok=True)
+        return
+
+    tmp_path.unlink(missing_ok=True)
+    last_loss = result.get("last_loss")
+    check("bpe trainer produced finite loss", last_loss is not None and math.isfinite(last_loss), f"last_loss={last_loss}")
+
+
+#====================
+# 24. JSON loader: extract training text from JSON payloads
+#====================
+
+def test_json_loader_extracts_text():
+    print("\n=== test_json_loader_extracts_text ===")
+    tmp_path = ROOT / "_tmp_loader.json"
+    payload = []
+    for _ in range(32):
+        payload.append({"text": "hello simplex"})
+        payload.append({"meta": {"content": "born rule attention"}})
+
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        raw = load_bytes(tmp_path, 100_000, data_format="auto", json_text_fields="text,content")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    text = raw.decode("utf-8", errors="replace")
+    check("json loader captured text field", "hello simplex" in text, text[:120])
+    check("json loader captured nested content field", "born rule attention" in text, text[:120])
+    check("json loader emitted plain corpus text", "\"text\"" not in text and "{" not in text, text[:120])
+
+
+#====================
+# 25. JSON trainer smoke: train on JSONL without changing QTS math
+#====================
+
+def test_json_trainer_smoke():
+    print("\n=== test_json_trainer_smoke ===")
+    tmp_path = ROOT / "_tmp_dataset.jsonl"
+    lines = []
+    for _ in range(64):
+        lines.append(json.dumps({"text": "hello simplex transformer born rule attention stream"}))
+
+    try:
+        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            data_format="jsonl",
+            json_text_fields="text",
+            tokenizer="byte",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            steps=2,
+            no_save=True,
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=16,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    last_loss = result.get("last_loss")
+    check("json trainer produced finite loss", last_loss is not None and math.isfinite(last_loss), f"last_loss={last_loss}")
+
+
+#====================
 # run all
 #====================
 
@@ -895,6 +1049,11 @@ if __name__ == "__main__":
     test_init_near_uniform()
     test_determinism()
     test_residual_matters()
+    test_byte_tokenizer_roundtrip()
+    test_bpe_tokenizer_roundtrip()
+    test_bpe_trainer_smoke()
+    test_json_loader_extracts_text()
+    test_json_trainer_smoke()
 
     elapsed = time.time() - t0
 

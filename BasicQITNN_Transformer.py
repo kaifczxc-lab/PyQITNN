@@ -52,22 +52,27 @@ import pyqitnn
 class TrainConfig:
     #====================
     # data
-    # dataset: path to a .txt file or a directory with text files
+    # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
-    # right now only support .txt files, in future will be JSON
     #====================
-    dataset: str | Path = r"YOUR_DATASET_PATH"   # path to .txt file or directory with text files
+    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
     test_dir: str | Path | None = None
     max_bytes: int = 50_000_000       # max bytes to load per data source
+    data_format: str = "auto"         # "auto", "text", "json", "jsonl"
+    json_text_fields: str | None = None   # comma-separated preferred text fields, e.g. "text,content"
+    tokenizer: str = "bpe"           # "byte" or "bpe"
+    tokenizer_path: str | Path | None = None
+    tokenizer_vocab_size: int = 4096
+    tokenizer_min_frequency: int = 2
 
     #====================
     # model
     #====================
-    dim: int = 256
-    ffn: int = 512
+    dim: int = 64
+    ffn: int = 128
     layers: int = 2
     seq_len: int = 256
 
@@ -79,7 +84,7 @@ class TrainConfig:
     batch_size: int = 4
     steps: int | None = None         # if set, overrides epochs/steps_per_epoch
     epochs: int = 20
-    steps_per_epoch: int = 1000
+    steps_per_epoch: int = 2000
     grad_clip: float = 1.0
     #====================
     # optimizer
@@ -143,8 +148,10 @@ class TrainConfig:
     temperature: float = 0.65
     top_k: int = 12
     gen_bytes: int = 160
+    gen_tokens: int | None = None
     prompt: str = ""                 # empty = use random slice from training data
     prompt_bytes: int = 64
+    prompt_tokens: int | None = None
     gen_every: int = 0               # generate sample every N epochs
     #====================
     # logging
@@ -173,26 +180,111 @@ class TrainConfig:
 #====================
 # data loading
 #====================
-def load_bytes(path: Path, limit: int) -> bytes:
+def _iter_data_files(path: Path) -> list[Path]:
+    if path.is_file():
+        return [path]
+    return sorted(p for p in path.rglob("*") if p.is_file())
+
+
+def _parse_json_field_spec(spec: str | None) -> set[str] | None:
+    if spec is None:
+        return None
+    keys = {part.strip() for part in spec.split(",") if part.strip()}
+    return keys or None
+
+
+def _resolve_data_format(path: Path, mode: str) -> str:
+    fmt = mode.strip().lower()
+    if fmt != "auto":
+        if fmt not in {"text", "json", "jsonl"}:
+            raise RuntimeError("data_format must be one of: auto, text, json, jsonl")
+        return fmt
+
+    suffix = path.suffix.lower()
+    if suffix in {".jsonl", ".ndjson"}:
+        return "jsonl"
+    if suffix == ".json":
+        return "json"
+    return "text"
+
+
+def _collect_json_strings(obj, wanted: set[str] | None) -> list[str]:
+    out: list[str] = []
+
+    if isinstance(obj, str):
+        if obj:
+            out.append(obj)
+        return out
+
+    if isinstance(obj, list):
+        for item in obj:
+            out.extend(_collect_json_strings(item, wanted))
+        return out
+
+    if isinstance(obj, dict):
+        if wanted:
+            matched = False
+            for key, value in obj.items():
+                if key in wanted:
+                    matched = True
+                    out.extend(_collect_json_strings(value, None))
+            if matched:
+                return out
+        for value in obj.values():
+            out.extend(_collect_json_strings(value, wanted))
+        return out
+
+    return out
+
+
+def _json_bytes_to_text_bytes(raw: bytes, source: Path, wanted: set[str] | None) -> bytes:
+    text = raw.decode("utf-8", errors="replace")
+    pieces: list[str] = []
+
+    if source.suffix.lower() in {".jsonl", ".ndjson"}:
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"invalid JSONL in {source} line {lineno}: {e}") from e
+            pieces.extend(_collect_json_strings(obj, wanted))
+    else:
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"invalid JSON in {source}: {e}") from e
+        pieces.extend(_collect_json_strings(obj, wanted))
+
+    joined = "\n\n".join(part for part in pieces if part)
+    return joined.encode("utf-8", errors="replace")
+
+
+def load_bytes(path: Path, limit: int, *, data_format: str = "auto", json_text_fields: str | None = None) -> bytes:
     if not path.exists():
         raise RuntimeError(
             f"data not found: {path}\n"
             f"pass a file or directory path via dataset='path/to/data'"
         )
-    if path.is_file():
-        files = [path]
-    else:
-        files = sorted(p for p in path.rglob("*") if p.is_file())
+    files = _iter_data_files(path)
     if not files:
         raise RuntimeError(f"no files in {path}")
+
+    wanted_fields = _parse_json_field_spec(json_text_fields)
     parts: list[bytes] = []
     total = 0
     for f in files:
         raw = f.read_bytes()
         if not raw:
             continue
-        take = min(len(raw), limit - total)
-        parts.append(raw[:take])
+        file_format = _resolve_data_format(f, data_format)
+        cooked = raw if file_format == "text" else _json_bytes_to_text_bytes(raw, f, wanted_fields)
+        if not cooked:
+            continue
+        take = min(len(cooked), limit - total)
+        parts.append(cooked[:take])
         total += take
         if total >= limit:
             break
@@ -205,6 +297,16 @@ def split_train_val(data: torch.Tensor, seq_len: int, val_div: int):
     val_n = min(val_n, data.numel() - min_tok)
     train_n = data.numel() - val_n
     return data[:train_n], data[train_n:]
+
+
+def split_train_val_raw(raw: bytes, val_div: int):
+    min_bytes = 1024
+    if len(raw) < (2 * min_bytes):
+        raise RuntimeError("dataset too small (need >= 2048 bytes for BPE split)")
+    val_n = max(len(raw) // val_div, min_bytes)
+    val_n = min(val_n, len(raw) - min_bytes)
+    train_n = len(raw) - val_n
+    return raw[:train_n], raw[train_n:]
 #====================
 # batch sampling
 #====================
@@ -245,19 +347,61 @@ def run_val(model, val_data: torch.Tensor, seq_len: int, device: torch.device, m
 #====================
 # text generation
 #====================
-def decode_bytes(tokens: torch.Tensor) -> str:
-    return bytes(int(v) & 0xFF for v in tokens.reshape(-1).tolist()).decode("utf-8", errors="replace")
-def make_prompt(data: torch.Tensor, text: str, n_bytes: int, device: torch.device):
+def decode_tokens(tokenizer, tokens: torch.Tensor) -> str:
+    return tokenizer.decode(tokens.reshape(-1).tolist())
+
+
+def safe_console_text(text: str) -> str:
+    enc = sys.stdout.encoding or "utf-8"
+    return text.encode(enc, errors="replace").decode(enc, errors="replace")
+
+
+def make_prompt(data: torch.Tensor, text: str, n_units: int, device: torch.device, tokenizer):
     if text:
-        raw = text.encode("utf-8", errors="replace")[:n_bytes] or b" "
-        tok = torch.tensor(list(raw), dtype=torch.long)
+        ids = tokenizer.encode_text(text)[:n_units]
+        if not ids:
+            ids = tokenizer.encode_text(" ")
+        tok = torch.tensor(ids, dtype=torch.long)
     else:
-        tok = data[: min(n_bytes, data.numel())]
+        tok = data[: min(n_units, data.numel())].detach().cpu()
+    if tok.numel() <= 0:
+        raise RuntimeError("prompt must contain at least one token")
     return tok.unsqueeze(0).to(device, non_blocking=True)
-def generate_text(model, data, *, prompt, prompt_bytes, gen_bytes, temperature, top_k, device):
-    tok = make_prompt(data, prompt, prompt_bytes, device)
-    out = model.generate(tok, max_new_tokens=gen_bytes, temperature=temperature, top_k=top_k, ascii_guard=True)
-    return decode_bytes(out[0])
+
+
+def _prompt_units(cfg: TrainConfig, tokenizer) -> int:
+    if getattr(tokenizer, "kind", "byte") == "byte":
+        return int(cfg.prompt_bytes)
+    if cfg.prompt_tokens is not None:
+        return int(cfg.prompt_tokens)
+    return int(cfg.prompt_bytes)
+
+
+def _gen_units(cfg: TrainConfig, tokenizer) -> int:
+    if getattr(tokenizer, "kind", "byte") == "byte":
+        return int(cfg.gen_bytes)
+    if cfg.gen_tokens is not None:
+        return int(cfg.gen_tokens)
+    return int(cfg.gen_bytes)
+
+
+def infer_tokenizer_path(resume: str | None) -> Path | None:
+    if not resume:
+        return None
+    cand = Path(resume).resolve().parent / "tokenizer.json"
+    return cand if cand.exists() else None
+
+
+def generate_text(model, data, *, tokenizer, prompt, prompt_units, gen_units, temperature, top_k, device):
+    tok = make_prompt(data, prompt, prompt_units, device, tokenizer)
+    out = model.generate(
+        tok,
+        max_new_tokens=gen_units,
+        temperature=temperature,
+        top_k=top_k,
+        ascii_guard=bool(getattr(tokenizer, "uses_ascii_guard", False)),
+    )
+    return decode_tokens(tokenizer, out[0])
 #====================
 # lr schedules
 #====================
@@ -265,6 +409,35 @@ def lr_linear(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 def lr_cosine(a: float, b: float, t: float) -> float:
     return b + 0.5 * (a - b) * (1.0 + math.cos(math.pi * t))
+
+
+def loss_to_perplexity(loss: float | None) -> float | None:
+    if loss is None:
+        return None
+    if math.isnan(loss):
+        return float("nan")
+    # cross-entropy is in nats, so LM perplexity is exp(loss)
+    if loss >= 80.0:
+        return float("inf")
+    return math.exp(loss)
+
+
+def tokens_per_sec(tokens: int, dt: float) -> float | None:
+    if tokens <= 0:
+        return None
+    if dt <= 0.0:
+        return float("inf")
+    return float(tokens) / float(dt)
+
+
+def fmt_metric(value: float | None, digits: int = 6) -> str:
+    if value is None:
+        return "n/a"
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        return "inf"
+    return f"{value:.{digits}f}"
 #====================
 # checkpoints
 #====================
@@ -290,7 +463,17 @@ def load_ckpt(path: Path, model, opt, device):
 # csv logger
 #====================
 class CsvLog:
-    HEADER = ["epoch", "train_loss", "val_loss", "lr", "time_s"]
+    HEADER = [
+        "epoch",
+        "train_loss",
+        "train_ppl",
+        "val_loss",
+        "val_ppl",
+        "train_tok_s",
+        "val_tok_s",
+        "lr",
+        "time_s",
+    ]
     def __init__(self, path: str | None):
         self._file = None
         self._writer = None
@@ -303,10 +486,32 @@ class CsvLog:
         self._writer = csv.writer(self._file)
         if need_header:
             self._writer.writerow(self.HEADER)
-    def row(self, epoch: int, train_loss: float, val_loss: float, lr: float, dt: float):
+
+    def row(
+        self,
+        epoch: int,
+        train_loss: float,
+        train_ppl: float | None,
+        val_loss: float | None,
+        val_ppl: float | None,
+        train_tok_s: float | None,
+        val_tok_s: float | None,
+        lr: float,
+        dt: float,
+    ):
         if self._writer is None:
             return
-        self._writer.writerow([epoch, f"{train_loss:.6f}", f"{val_loss:.6f}", f"{lr:.8f}", f"{dt:.1f}"])
+        self._writer.writerow([
+            epoch,
+            fmt_metric(train_loss, 6),
+            fmt_metric(train_ppl, 6),
+            fmt_metric(val_loss, 6),
+            fmt_metric(val_ppl, 6),
+            fmt_metric(train_tok_s, 2),
+            fmt_metric(val_tok_s, 2),
+            f"{lr:.8f}",
+            f"{dt:.1f}",
+        ])
         self._file.flush()
     def close(self):
         if self._file is not None:
@@ -317,8 +522,7 @@ class CsvLog:
 # train
 #====================
 def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
-    """Run training. Returns dict with first_loss, last_loss, best_val,
-    test_loss, run_dir, model.
+    """Run training. Returns dict with loss/perplexity metrics, run_dir, model.
 
     Usage:
         # from Python
@@ -359,6 +563,9 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     el_qk = cfg.ent_lambda if cfg.ent_lambda_qk is None else cfg.ent_lambda_qk
     el_vo = cfg.ent_lambda if cfg.ent_lambda_vo is None else cfg.ent_lambda_vo
     el_ff = cfg.ent_lambda if cfg.ent_lambda_ff is None else cfg.ent_lambda_ff
+    tokenizer_mode = cfg.tokenizer.strip().lower()
+    if tokenizer_mode not in {"byte", "bpe"}:
+        raise RuntimeError("tokenizer must be 'byte' or 'bpe'")
 
     sched = lr_cosine if cfg.lr_schedule == "cosine" else lr_linear
     interactive = False
@@ -379,29 +586,67 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     # data
     #====================
     test_data: torch.Tensor | None = None
+    test_raw: bytes | None = None
     if cfg.extended_dataset:
         # extended mode: separate train/val/test directories
         t_dir = Path(cfg.train_dir) if cfg.train_dir else Path(cfg.dataset)
-        train_raw = load_bytes(t_dir, cfg.max_bytes)
-        train_data = torch.tensor(list(train_raw), dtype=torch.long)
+        train_raw = load_bytes(t_dir, cfg.max_bytes, data_format=cfg.data_format, json_text_fields=cfg.json_text_fields)
         if cfg.val_dir is not None:
-            val_raw = load_bytes(Path(cfg.val_dir), cfg.max_bytes)
-            val_data = torch.tensor(list(val_raw), dtype=torch.long)
+            val_raw = load_bytes(Path(cfg.val_dir), cfg.max_bytes, data_format=cfg.data_format, json_text_fields=cfg.json_text_fields)
         else:
+            val_raw = b""
             val_data = torch.tensor([], dtype=torch.long)
         if cfg.test_dir is not None:
-            test_raw = load_bytes(Path(cfg.test_dir), cfg.max_bytes)
-            test_data = torch.tensor(list(test_raw), dtype=torch.long)
+            test_raw = load_bytes(Path(cfg.test_dir), cfg.max_bytes, data_format=cfg.data_format, json_text_fields=cfg.json_text_fields)
     else:
         # simple mode: one file/folder, auto-split into train/val
-        raw = load_bytes(Path(cfg.dataset), cfg.max_bytes)
-        data = torch.tensor(list(raw), dtype=torch.long)
-        train_data, val_data = split_train_val(data, cfg.seq_len, cfg.val_split_div)
+        raw = load_bytes(Path(cfg.dataset), cfg.max_bytes, data_format=cfg.data_format, json_text_fields=cfg.json_text_fields)
+        if tokenizer_mode == "byte":
+            data = torch.tensor(list(raw), dtype=torch.long)
+            train_data, val_data = split_train_val(data, cfg.seq_len, cfg.val_split_div)
+            train_raw = b""
+            val_raw = b""
+        else:
+            train_raw, val_raw = split_train_val_raw(raw, cfg.val_split_div)
+
+    tokenizer_path = Path(cfg.tokenizer_path) if cfg.tokenizer_path else infer_tokenizer_path(cfg.resume)
+    if tokenizer_mode == "byte":
+        tokenizer = pyqitnn.load_text_tokenizer("byte")
+        if cfg.extended_dataset:
+            train_data = torch.tensor(tokenizer.encode_bytes(train_raw), dtype=torch.long)
+            val_data = torch.tensor(tokenizer.encode_bytes(val_raw), dtype=torch.long)
+            if test_raw is not None:
+                test_data = torch.tensor(tokenizer.encode_bytes(test_raw), dtype=torch.long)
+    else:
+        train_text = train_raw.decode("utf-8", errors="replace")
+        val_text = val_raw.decode("utf-8", errors="replace")
+        train_texts = None if tokenizer_path is not None and tokenizer_path.exists() else [train_text]
+        tokenizer = pyqitnn.load_text_tokenizer(
+            "bpe",
+            path=tokenizer_path,
+            train_texts=train_texts,
+            vocab_size=cfg.tokenizer_vocab_size,
+            min_frequency=cfg.tokenizer_min_frequency,
+        )
+        train_data = torch.tensor(tokenizer.encode_text(train_text), dtype=torch.long)
+        val_data = torch.tensor(tokenizer.encode_text(val_text), dtype=torch.long) if val_text else torch.tensor([], dtype=torch.long)
+        if test_raw is not None:
+            test_text = test_raw.decode("utf-8", errors="replace")
+            test_data = torch.tensor(tokenizer.encode_text(test_text), dtype=torch.long)
+        if cfg.tokenizer_path is not None and not Path(cfg.tokenizer_path).exists():
+            tokenizer.save(cfg.tokenizer_path)
+
+    min_train_tokens = cfg.seq_len + 2
+    if train_data.numel() < min_train_tokens:
+        raise RuntimeError(
+            f"train token stream too small after {tokenizer.kind} tokenization: "
+            f"{train_data.numel()} tokens (need >= {min_train_tokens})"
+        )
     #====================
     # model
     #====================
     model = pyqitnn.QITNNSimplexTransformerLM(
-        vocab_size=256,
+        vocab_size=tokenizer.vocab_size,
         dim=cfg.dim,
         ffn_dim=cfg.ffn,
         seq_len=cfg.seq_len,
@@ -485,10 +730,13 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         run_name = cfg.run_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         run_dir = Path(cfg.save_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
+        tokenizer_asset = tokenizer.save(run_dir / "tokenizer.json")
         config_dict = {k: str(v) if isinstance(v, Path) else v
                        for k, v in asdict(cfg).items()}
         config_dict["run_dir"] = str(run_dir)
         config_dict["params"] = n_params
+        config_dict["tokenizer_summary"] = tokenizer.summary()
+        config_dict["tokenizer_asset"] = str(tokenizer_asset)
         (run_dir / "config.json").write_text(
             json.dumps(config_dict, indent=2, ensure_ascii=False), encoding="utf-8")
     #====================
@@ -501,10 +749,13 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     #====================
     # print config
     #====================
-    print(f"train_bytes   {train_data.numel()}")
-    print(f"val_bytes     {val_data.numel()}")
+    print(f"tokenizer     {tokenizer.kind}")
+    print(f"vocab_size    {tokenizer.vocab_size}")
+    print(f"data_format   {cfg.data_format}")
+    print(f"train_tokens  {train_data.numel()}")
+    print(f"val_tokens    {val_data.numel()}")
     if test_data is not None:
-        print(f"test_bytes    {test_data.numel()}")
+        print(f"test_tokens   {test_data.numel()}")
     print(f"params        {n_params:,}")
     print(f"optimizer     {cfg.optimizer}")
     print(f"lr            {lr_start} -> {lr_end}  ({cfg.lr_schedule})")
@@ -522,10 +773,17 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     last_loss = None
     best_train = None
     best_train_ep = 0
+    last_epoch_train_loss = None
+    last_epoch_train_ppl = None
+    last_epoch_val_loss = None
+    last_epoch_val_ppl = None
+    last_epoch_train_tok_s = None
+    last_epoch_val_tok_s = None
     model.train()
     for ep in range(start_ep, epochs + 1):
         ep_loss = 0.0
         ep_n = 0
+        ep_tokens = 0
         t0 = time.time()
         for step in range(1, steps_per_ep + 1):
             global_step += 1
@@ -564,33 +822,67 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             last_loss = train_loss
             ep_loss += train_loss
             ep_n += 1
+            ep_tokens += int(y.numel())
             if step % cfg.log_every == 0 or step == steps_per_ep:
-                print(f"  [{step}] train_loss={ep_loss / ep_n:.11f}  lr={lr_now:.8f}")
+                run_train_loss = ep_loss / ep_n
+                run_train_ppl = loss_to_perplexity(run_train_loss)
+                run_train_tok_s = tokens_per_sec(ep_tokens, time.time() - t0)
+                print(
+                    f"  [{step}] "
+                    f"train_loss={run_train_loss:.11f}  "
+                    f"train_ppl={fmt_metric(run_train_ppl, 4)}  "
+                    f"tok/s={fmt_metric(run_train_tok_s, 1)}  "
+                    f"lr={lr_now:.8f}"
+                )
         #====================
         # epoch end
         #====================
         ep_time = time.time() - t0
         avg_train = ep_loss / max(ep_n, 1)
+        train_ppl = loss_to_perplexity(avg_train)
+        train_tok_s = tokens_per_sec(ep_tokens, ep_time)
+        last_epoch_train_loss = avg_train
+        last_epoch_train_ppl = train_ppl
+        last_epoch_train_tok_s = train_tok_s
         if best_train is None or avg_train < best_train:
             best_train = avg_train
             best_train_ep = ep
+        t_val = time.time()
         avg_val, n_val = run_val(model, val_data, cfg.seq_len, device, cfg.val_steps)
+        val_time = time.time() - t_val
+        val_loss = avg_val if n_val > 0 else None
+        val_ppl = loss_to_perplexity(val_loss)
+        val_tok_s = tokens_per_sec(n_val * cfg.seq_len, val_time)
+        last_epoch_val_loss = val_loss
+        last_epoch_val_ppl = val_ppl
+        last_epoch_val_tok_s = val_tok_s
         new_best = n_val > 0 and (best_val is None or avg_val < best_val)
         if new_best:
             best_val = avg_val
             best_val_ep = ep
-        bt = best_train or 0.0
-        bv = best_val or 0.0
+        bt = best_train
+        bv = best_val
+        best_train_ppl = loss_to_perplexity(bt)
+        best_val_ppl = loss_to_perplexity(bv)
         print(
             f"epoch {ep}/{epochs}  "
-            f"train_avg_loss={avg_train:.11f}  val_avg_loss={avg_val:.10f}  "
-            f"train_steps={ep_n}  val_steps={n_val}  "
-            f"best_train={bt:.11f}@{best_train_ep}  best_val={bv:.10f}@{best_val_ep}  "
+            f"train_loss={avg_train:.11f}  "
+            f"train_ppl={fmt_metric(train_ppl, 4)}  "
+            f"val_loss={fmt_metric(val_loss, 10)}  "
+            f"val_ppl={fmt_metric(val_ppl, 4)}"
+        )
+        print(
+            f"  steps train={ep_n} val={n_val}  "
+            f"tok/s train={fmt_metric(train_tok_s, 1)} val={fmt_metric(val_tok_s, 1)}  "
+            f"best_train={fmt_metric(bt, 11)}@{best_train_ep} "
+            f"(ppl={fmt_metric(best_train_ppl, 4)})  "
+            f"best_val={fmt_metric(bv, 10)}@{best_val_ep} "
+            f"(ppl={fmt_metric(best_val_ppl, 4)})  "
             f"time={ep_time:.1f}s"
         )
         for line in model.format_qitnn_diagnostics(epoch=ep, full=(ep % cfg.diag_every == 0)):
             print(line)
-        log.row(ep, avg_train, avg_val, lr_now, ep_time)
+        log.row(ep, avg_train, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr_now, ep_time)
         # save best checkpoint
         if run_dir is not None and new_best:
             save_ckpt(run_dir / "ckpt_best.pt", model, opt, ep, global_step, best_val,
@@ -606,11 +898,14 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         if cfg.gen_every > 0 and ep % cfg.gen_every == 0:
             txt = generate_text(
                 model, train_data,
-                prompt=cfg.prompt, prompt_bytes=cfg.prompt_bytes,
-                gen_bytes=cfg.gen_bytes, temperature=cfg.temperature,
+                tokenizer=tokenizer,
+                prompt=cfg.prompt,
+                prompt_units=_prompt_units(cfg, tokenizer),
+                gen_units=_gen_units(cfg, tokenizer),
+                temperature=cfg.temperature,
                 top_k=cfg.top_k, device=device,
             )
-            print(f"  [gen@{ep}] {txt}")
+            print(f"  [gen@{ep}] {safe_console_text(txt)}")
     #====================
     # final save
     #====================
@@ -622,26 +917,37 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     # test evaluation
     #====================
     test_loss = None
+    test_ppl = None
     if test_data is not None and test_data.numel() > cfg.seq_len + 1:
         avg_test, n_test = run_val(model, test_data, cfg.seq_len, device, cfg.val_steps)
         if n_test > 0:
             test_loss = avg_test
-            print(f"test_loss     {test_loss:.10f}  ({n_test} windows)")
+            test_ppl = loss_to_perplexity(test_loss)
+            print(
+                f"test_loss     {test_loss:.10f}  "
+                f"test_ppl={fmt_metric(test_ppl, 4)}  "
+                f"({n_test} windows)"
+            )
     log.close()
     print("first_loss", first_loss)
     print("last_loss", last_loss)
+    print("first_ppl", loss_to_perplexity(first_loss))
+    print("last_ppl", loss_to_perplexity(last_loss))
     #====================
     # generation
     #====================
     if cfg.prompt or not interactive:
         txt = generate_text(
             model, train_data,
-            prompt=cfg.prompt, prompt_bytes=cfg.prompt_bytes,
-            gen_bytes=cfg.gen_bytes, temperature=cfg.temperature,
+            tokenizer=tokenizer,
+            prompt=cfg.prompt,
+            prompt_units=_prompt_units(cfg, tokenizer),
+            gen_units=_gen_units(cfg, tokenizer),
+            temperature=cfg.temperature,
             top_k=cfg.top_k, device=device,
         )
         print("generated_text_begin")
-        print(txt)
+        print(safe_console_text(txt))
         print("generated_text_end")
     #====================
     # interactive mode
@@ -659,20 +965,34 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
                 break
             txt = generate_text(
                 model, train_data,
-                prompt=user_input, prompt_bytes=cfg.prompt_bytes,
-                gen_bytes=cfg.gen_bytes, temperature=cfg.temperature,
+                tokenizer=tokenizer,
+                prompt=user_input,
+                prompt_units=_prompt_units(cfg, tokenizer),
+                gen_units=_gen_units(cfg, tokenizer),
+                temperature=cfg.temperature,
                 top_k=cfg.top_k, device=device,
             )
             print("generated_text_begin")
-            print(txt)
+            print(safe_console_text(txt))
             print("generated_text_end")
     return {
         "first_loss": first_loss,
+        "first_ppl": loss_to_perplexity(first_loss),
         "last_loss": last_loss,
+        "last_ppl": loss_to_perplexity(last_loss),
         "best_val": best_val,
+        "best_val_ppl": loss_to_perplexity(best_val),
         "test_loss": test_loss,
+        "test_ppl": test_ppl,
+        "last_epoch_train_loss": last_epoch_train_loss,
+        "last_epoch_train_ppl": last_epoch_train_ppl,
+        "last_epoch_val_loss": last_epoch_val_loss,
+        "last_epoch_val_ppl": last_epoch_val_ppl,
+        "last_epoch_train_tok_s": last_epoch_train_tok_s,
+        "last_epoch_val_tok_s": last_epoch_val_tok_s,
         "run_dir": str(run_dir) if run_dir else None,
         "model": model,
+        "tokenizer": tokenizer,
     }
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
@@ -689,6 +1009,12 @@ def _parse_cli() -> TrainConfig:
     p.add_argument("--val-dir",           type=str,   default=None)
     p.add_argument("--test-dir",          type=str,   default=None)
     p.add_argument("--max-bytes",         type=int,   default=D.max_bytes)
+    p.add_argument("--data-format",       type=str,   default=D.data_format, choices=("auto", "text", "json", "jsonl"))
+    p.add_argument("--json-text-fields",  type=str,   default=D.json_text_fields)
+    p.add_argument("--tokenizer",         type=str,   default=D.tokenizer, choices=("byte", "bpe"))
+    p.add_argument("--tokenizer-path",    type=str,   default=None)
+    p.add_argument("--tokenizer-vocab-size", type=int, default=D.tokenizer_vocab_size)
+    p.add_argument("--tokenizer-min-frequency", type=int, default=D.tokenizer_min_frequency)
     # model
     p.add_argument("--dim",          type=int,   default=D.dim)
     p.add_argument("--ffn",          type=int,   default=D.ffn)
@@ -745,8 +1071,10 @@ def _parse_cli() -> TrainConfig:
     p.add_argument("--temperature",     type=float, default=D.temperature)
     p.add_argument("--top-k",           type=int,   default=D.top_k)
     p.add_argument("--gen-bytes",       type=int,   default=D.gen_bytes)
+    p.add_argument("--gen-tokens",      type=int,   default=None)
     p.add_argument("--prompt",          type=str,   default=D.prompt)
     p.add_argument("--prompt-bytes",    type=int,   default=D.prompt_bytes)
+    p.add_argument("--prompt-tokens",   type=int,   default=None)
     p.add_argument("--gen-every",       type=int,   default=D.gen_every)
     # logging
     p.add_argument("--log-every",       type=int, default=D.log_every)
