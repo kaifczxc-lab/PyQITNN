@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import os
 import sys
 from pathlib import Path
@@ -55,6 +56,31 @@ def _cuda_bin_dir() -> Path | None:
     return None
 
 
+def _candidate_native_paths() -> list[Path]:
+    pkg = Path(__file__).resolve().parent
+    candidates = sorted(pkg.glob(_EXT_GLOB))
+
+    build_dir = pkg.parent / "build"
+    if build_dir.exists():
+        for candidate in sorted(build_dir.glob("lib*"), reverse=True):
+            candidates.extend(sorted((candidate / "pyqitnn").glob(_EXT_GLOB)))
+
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for path in candidates:
+        if path.exists() and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
+def _pick_native_path() -> Path | None:
+    candidates = _candidate_native_paths()
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime_ns)
+
+
 #====================
 # library search path setup
 #====================
@@ -105,14 +131,24 @@ def load_native():
     import torch  # noqa: F401
 
     prepare_runtime()
-    _NATIVE = importlib.import_module("pyqitnn._C")
+    native_path = _pick_native_path()
+    if native_path is None:
+        _NATIVE = importlib.import_module("pyqitnn._C")
+        return _NATIVE
+
+    spec = importlib.util.spec_from_file_location("pyqitnn._C", native_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot create import spec for native extension: {native_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["pyqitnn._C"] = module
+    spec.loader.exec_module(module)
+    _NATIVE = module
     return _NATIVE
 
 
 def bridge_status() -> dict[str, object]:
     """Check native extension status. Attempts actual import to verify."""
-    pkg = Path(__file__).resolve().parent
-    native_path = next(pkg.glob(_EXT_GLOB), None)
+    native_path = _pick_native_path()
     loadable = False
     load_error: str | None = None
     if native_path is not None:

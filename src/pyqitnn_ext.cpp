@@ -13,8 +13,38 @@ void check_cuda_f32_2d(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+void check_cuda_amp_2d(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(
+        t.scalar_type() == torch::kFloat32 ||
+        t.scalar_type() == torch::kFloat16 ||
+        t.scalar_type() == torch::kBFloat16,
+        name,
+        " must be float32, float16, or bfloat16"
+    );
+    TORCH_CHECK(t.dim() == 2, name, " must be 2D");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
 void check_same_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name, const char* b_name) {
     TORCH_CHECK(a.sizes() == b.sizes(), a_name, " shape must match ", b_name);
+}
+
+void check_same_dtype(const torch::Tensor& a, const torch::Tensor& b, const char* a_name, const char* b_name) {
+    TORCH_CHECK(a.scalar_type() == b.scalar_type(), a_name, " dtype must match ", b_name);
+}
+
+int tensor_dtype_code(const torch::Tensor& t) {
+    switch (t.scalar_type()) {
+        case torch::kFloat32:
+            return QITNN_DTYPE_FLOAT32;
+        case torch::kFloat16:
+            return QITNN_DTYPE_FLOAT16;
+        case torch::kBFloat16:
+            return QITNN_DTYPE_BFLOAT16;
+        default:
+            TORCH_CHECK(false, "unsupported dtype");
+    }
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward3_cuda(
@@ -23,7 +53,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor a_zero,
     torch::Tensor a_pos
 ) {
-    check_cuda_f32_2d(input, "input");
+    check_cuda_amp_2d(input, "input");
     check_cuda_f32_2d(a_neg, "a_neg");
     check_cuda_f32_2d(a_zero, "a_zero");
     check_cuda_f32_2d(a_pos, "a_pos");
@@ -42,17 +72,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
     auto out_u = torch::empty({rows, out_dim}, input.options());
     auto out_v = torch::empty({rows, out_dim}, input.options());
-    auto out_cn = torch::empty({rows, out_dim}, input.options());
-    auto out_cz = torch::empty({rows, out_dim}, input.options());
-    auto out_cp = torch::empty({rows, out_dim}, input.options());
+    auto fp32_opts = input.options().dtype(torch::kFloat32);
+    auto out_cn = torch::empty({rows, out_dim}, fp32_opts);
+    auto out_cz = torch::empty({rows, out_dim}, fp32_opts);
+    auto out_cp = torch::empty({rows, out_dim}, fp32_opts);
 
-    Qitnn_DeviceForward3(
-        input.data_ptr<float>(),
+    Qitnn_DeviceForward3Ex(
+        input.data_ptr(),
+        tensor_dtype_code(input),
         a_neg.data_ptr<float>(),
         a_zero.data_ptr<float>(),
         a_pos.data_ptr<float>(),
-        out_u.data_ptr<float>(),
-        out_v.data_ptr<float>(),
+        out_u.data_ptr(),
+        out_v.data_ptr(),
+        tensor_dtype_code(out_u),
         out_cn.data_ptr<float>(),
         out_cz.data_ptr<float>(),
         out_cp.data_ptr<float>(),
@@ -72,8 +105,9 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backnorm3_cuda(
     torch::Tensor cp,
     double ent_lambda
 ) {
-    check_cuda_f32_2d(du, "du");
-    check_cuda_f32_2d(dv, "dv");
+    check_cuda_amp_2d(du, "du");
+    check_cuda_amp_2d(dv, "dv");
+    check_same_dtype(du, dv, "du", "dv");
     check_cuda_f32_2d(cn, "cn");
     check_cuda_f32_2d(cz, "cz");
     check_cuda_f32_2d(cp, "cp");
@@ -93,9 +127,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backnorm3_cuda(
     auto dcz = torch::empty_like(cz);
     auto dcp = torch::empty_like(cp);
 
-    Qitnn_DeviceBackNorm3(
-        du.data_ptr<float>(),
-        dv.data_ptr<float>(),
+    Qitnn_DeviceBackNorm3Ex(
+        du.data_ptr(),
+        dv.data_ptr(),
+        tensor_dtype_code(du),
         cn.data_ptr<float>(),
         cz.data_ptr<float>(),
         cp.data_ptr<float>(),
@@ -116,21 +151,24 @@ void prior_cuda(
     double step,
     double entropy_floor
 ) {
-    check_cuda_f32_2d(a_neg, "a_neg");
-    check_cuda_f32_2d(a_zero, "a_zero");
-    check_cuda_f32_2d(a_pos, "a_pos");
+    check_cuda_amp_2d(a_neg, "a_neg");
+    check_cuda_amp_2d(a_zero, "a_zero");
+    check_cuda_amp_2d(a_pos, "a_pos");
 
     check_same_shape(a_neg, a_zero, "a_neg", "a_zero");
     check_same_shape(a_neg, a_pos, "a_neg", "a_pos");
+    check_same_dtype(a_neg, a_zero, "a_neg", "a_zero");
+    check_same_dtype(a_neg, a_pos, "a_neg", "a_pos");
 
     TORCH_CHECK(a_neg.get_device() == 0, "prior bridge currently supports only cuda:0");
     TORCH_CHECK(a_zero.get_device() == 0, "prior bridge currently supports only cuda:0");
     TORCH_CHECK(a_pos.get_device() == 0, "prior bridge currently supports only cuda:0");
 
-    Qitnn_DevicePrior(
-        a_neg.data_ptr<float>(),
-        a_zero.data_ptr<float>(),
-        a_pos.data_ptr<float>(),
+    Qitnn_DevicePriorEx(
+        a_neg.data_ptr(),
+        a_zero.data_ptr(),
+        a_pos.data_ptr(),
+        tensor_dtype_code(a_neg),
         static_cast<float>(step),
         static_cast<float>(entropy_floor),
         static_cast<int>(a_neg.numel())
@@ -141,9 +179,10 @@ std::tuple<torch::Tensor, torch::Tensor> centered_simplex_cuda(
     torch::Tensor u,
     torch::Tensor v
 ) {
-    check_cuda_f32_2d(u, "u");
-    check_cuda_f32_2d(v, "v");
+    check_cuda_amp_2d(u, "u");
+    check_cuda_amp_2d(v, "v");
     check_same_shape(u, v, "u", "v");
+    check_same_dtype(u, v, "u", "v");
 
     TORCH_CHECK(u.get_device() == 0, "centered_simplex bridge currently supports only cuda:0");
     TORCH_CHECK(v.get_device() == 0, "centered_simplex bridge currently supports only cuda:0");
@@ -151,11 +190,13 @@ std::tuple<torch::Tensor, torch::Tensor> centered_simplex_cuda(
     auto out_x = torch::empty_like(u);
     auto out_y = torch::empty_like(v);
 
-    Qitnn_DeviceCenteredSimplex(
-        u.data_ptr<float>(),
-        v.data_ptr<float>(),
-        out_x.data_ptr<float>(),
-        out_y.data_ptr<float>(),
+    Qitnn_DeviceCenteredSimplexEx(
+        u.data_ptr(),
+        v.data_ptr(),
+        tensor_dtype_code(u),
+        out_x.data_ptr(),
+        out_y.data_ptr(),
+        tensor_dtype_code(out_x),
         static_cast<int>(u.numel())
     );
 
@@ -170,18 +211,23 @@ std::tuple<torch::Tensor, torch::Tensor> attention2_cuda(
     torch::Tensor vx,
     torch::Tensor vy
 ) {
-    check_cuda_f32_2d(qx, "qx");
-    check_cuda_f32_2d(qy, "qy");
-    check_cuda_f32_2d(kx, "kx");
-    check_cuda_f32_2d(ky, "ky");
-    check_cuda_f32_2d(vx, "vx");
-    check_cuda_f32_2d(vy, "vy");
+    check_cuda_amp_2d(qx, "qx");
+    check_cuda_amp_2d(qy, "qy");
+    check_cuda_amp_2d(kx, "kx");
+    check_cuda_amp_2d(ky, "ky");
+    check_cuda_amp_2d(vx, "vx");
+    check_cuda_amp_2d(vy, "vy");
 
     check_same_shape(qx, qy, "qx", "qy");
     check_same_shape(qx, kx, "qx", "kx");
     check_same_shape(qx, ky, "qx", "ky");
     check_same_shape(qx, vx, "qx", "vx");
     check_same_shape(qx, vy, "qx", "vy");
+    check_same_dtype(qx, qy, "qx", "qy");
+    check_same_dtype(qx, kx, "qx", "kx");
+    check_same_dtype(qx, ky, "qx", "ky");
+    check_same_dtype(qx, vx, "qx", "vx");
+    check_same_dtype(qx, vy, "qx", "vy");
 
     TORCH_CHECK(qx.get_device() == 0, "attention2 bridge currently supports only cuda:0");
     TORCH_CHECK(qy.get_device() == 0, "attention2 bridge currently supports only cuda:0");
@@ -196,15 +242,17 @@ std::tuple<torch::Tensor, torch::Tensor> attention2_cuda(
     auto ox = torch::empty_like(qx);
     auto oy = torch::empty_like(qy);
 
-    Qitnn_DeviceAttention2(
-        qx.data_ptr<float>(),
-        qy.data_ptr<float>(),
-        kx.data_ptr<float>(),
-        ky.data_ptr<float>(),
-        vx.data_ptr<float>(),
-        vy.data_ptr<float>(),
-        ox.data_ptr<float>(),
-        oy.data_ptr<float>(),
+    Qitnn_DeviceAttention2Ex(
+        qx.data_ptr(),
+        qy.data_ptr(),
+        kx.data_ptr(),
+        ky.data_ptr(),
+        vx.data_ptr(),
+        vy.data_ptr(),
+        tensor_dtype_code(qx),
+        ox.data_ptr(),
+        oy.data_ptr(),
+        tensor_dtype_code(ox),
         seq_len,
         dim
     );
@@ -222,14 +270,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor vx,
     torch::Tensor vy
 ) {
-    check_cuda_f32_2d(dox, "dox");
-    check_cuda_f32_2d(doy, "doy");
-    check_cuda_f32_2d(qx, "qx");
-    check_cuda_f32_2d(qy, "qy");
-    check_cuda_f32_2d(kx, "kx");
-    check_cuda_f32_2d(ky, "ky");
-    check_cuda_f32_2d(vx, "vx");
-    check_cuda_f32_2d(vy, "vy");
+    check_cuda_amp_2d(dox, "dox");
+    check_cuda_amp_2d(doy, "doy");
+    check_cuda_amp_2d(qx, "qx");
+    check_cuda_amp_2d(qy, "qy");
+    check_cuda_amp_2d(kx, "kx");
+    check_cuda_amp_2d(ky, "ky");
+    check_cuda_amp_2d(vx, "vx");
+    check_cuda_amp_2d(vy, "vy");
 
     check_same_shape(dox, doy, "dox", "doy");
     check_same_shape(dox, qx, "dox", "qx");
@@ -238,6 +286,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     check_same_shape(qx, ky, "qx", "ky");
     check_same_shape(qx, vx, "qx", "vx");
     check_same_shape(qx, vy, "qx", "vy");
+    check_same_dtype(dox, doy, "dox", "doy");
+    check_same_dtype(dox, qx, "dox", "qx");
+    check_same_dtype(qx, qy, "qx", "qy");
+    check_same_dtype(qx, kx, "qx", "kx");
+    check_same_dtype(qx, ky, "qx", "ky");
+    check_same_dtype(qx, vx, "qx", "vx");
+    check_same_dtype(qx, vy, "qx", "vy");
 
     TORCH_CHECK(dox.get_device() == 0, "attention backward bridge currently supports only cuda:0");
     TORCH_CHECK(doy.get_device() == 0, "attention backward bridge currently supports only cuda:0");
@@ -258,21 +313,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto dvx = torch::empty_like(vx);
     auto dvy = torch::empty_like(vy);
 
-    Qitnn_DeviceAttentionBackward2(
-        dqx.data_ptr<float>(),
-        dqy.data_ptr<float>(),
-        dkx.data_ptr<float>(),
-        dky.data_ptr<float>(),
-        dvx.data_ptr<float>(),
-        dvy.data_ptr<float>(),
-        qx.data_ptr<float>(),
-        qy.data_ptr<float>(),
-        kx.data_ptr<float>(),
-        ky.data_ptr<float>(),
-        vx.data_ptr<float>(),
-        vy.data_ptr<float>(),
-        dox.data_ptr<float>(),
-        doy.data_ptr<float>(),
+    Qitnn_DeviceAttentionBackward2Ex(
+        dqx.data_ptr(),
+        dqy.data_ptr(),
+        dkx.data_ptr(),
+        dky.data_ptr(),
+        dvx.data_ptr(),
+        dvy.data_ptr(),
+        tensor_dtype_code(dqx),
+        qx.data_ptr(),
+        qy.data_ptr(),
+        kx.data_ptr(),
+        ky.data_ptr(),
+        vx.data_ptr(),
+        vy.data_ptr(),
+        dox.data_ptr(),
+        doy.data_ptr(),
+        tensor_dtype_code(qx),
         seq_len,
         dim
     );

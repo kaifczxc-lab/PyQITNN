@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,7 @@ from torch import nn
 
 from .diagnostics import render_qitnn_diag
 from .modules import QITNNLinear
+from .modules import _resolve_precision_mode_args
 from .ops import attention2
 from .ops import prior_
 
@@ -22,6 +24,16 @@ def _flatten(x: torch.Tensor) -> torch.Tensor:
 
 def _unflatten(x: torch.Tensor, batch: int, seq: int) -> torch.Tensor:
     return x.reshape(batch, seq, x.size(-1))
+
+
+def _runtime_mixed_dtype() -> torch.dtype:
+    return torch.bfloat16
+
+
+def _maybe_cast_activation(x: torch.Tensor, enabled: bool) -> torch.Tensor:
+    if not enabled or not x.is_cuda or x.dtype != torch.float32:
+        return x
+    return x.to(dtype=_runtime_mixed_dtype())
 
 
 #====================
@@ -50,6 +62,8 @@ class QITNNSimplexBlock(nn.Module):
         ent_lambda_vo: float = 0.0,
         ent_lambda_ff: float = 0.0,
         init_std: float = 0.02,
+        mixed_precision: bool | None = None,
+        precision_mode: str | None = None,
         device=None,
         dtype=torch.float32,
     ) -> None:
@@ -59,37 +73,44 @@ class QITNNSimplexBlock(nn.Module):
         self.ffn_dim = int(ffn_dim)
         self.visible_dim = self.proj_dim * 2
         self.ff_visible_dim = self.ffn_dim * 2
+        self.precision_mode, self.mixed_precision = _resolve_precision_mode_args(
+            precision_mode,
+            mixed_precision,
+        )
 
         kw = {"device": device, "dtype": dtype}
 
         # attention
         self.ln1 = nn.LayerNorm(self.hidden_dim, **kw)
-        self.q_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_qk, init_std=init_std, device=device, dtype=dtype)
-        self.k_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_qk, init_std=init_std, device=device, dtype=dtype)
-        self.v_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_vo, init_std=init_std, device=device, dtype=dtype)
-        self.o_proj = QITNNLinear(self.visible_dim, self.proj_dim, ent_lambda=ent_lambda_vo, init_std=init_std, device=device, dtype=dtype)
+        self.q_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_qk, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
+        self.k_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_qk, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
+        self.v_proj = QITNNLinear(self.hidden_dim, self.proj_dim, ent_lambda=ent_lambda_vo, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
+        self.o_proj = QITNNLinear(self.visible_dim, self.proj_dim, ent_lambda=ent_lambda_vo, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
 
         # feedforward
         self.ln2 = nn.LayerNorm(self.hidden_dim, **kw)
-        self.ff1 = QITNNLinear(self.hidden_dim, self.ffn_dim, ent_lambda=ent_lambda_ff, init_std=init_std, device=device, dtype=dtype)
-        self.ff2 = QITNNLinear(self.ff_visible_dim, self.proj_dim, ent_lambda=ent_lambda_ff, init_std=init_std, device=device, dtype=dtype)
+        self.ff1 = QITNNLinear(self.hidden_dim, self.ffn_dim, ent_lambda=ent_lambda_ff, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
+        self.ff2 = QITNNLinear(self.ff_visible_dim, self.proj_dim, ent_lambda=ent_lambda_ff, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         B, S, _ = hidden.shape
+        hidden = _maybe_cast_activation(hidden, self.mixed_precision)
 
         # self-attention
         norm = self.ln1(hidden)
         q = _unflatten(self.q_proj(_flatten(norm)), B, S)
         k = _unflatten(self.k_proj(_flatten(norm)), B, S)
         v = _unflatten(self.v_proj(_flatten(norm)), B, S)
-        attn = attention2(q.contiguous(), k.contiguous(), v.contiguous())
+        attn = attention2(q.contiguous(), k.contiguous(), v.contiguous(), mixed_precision=self.mixed_precision)
         hidden = hidden + _unflatten(self.o_proj(_flatten(attn)), B, S)
+        hidden = _maybe_cast_activation(hidden, self.mixed_precision)
 
         # feedforward
         ff_in = self.ln2(hidden)
         ff_mid = _unflatten(self.ff1(_flatten(ff_in)), B, S)
         ff_mid = simplex_gelu(ff_mid)
         hidden = hidden + _unflatten(self.ff2(_flatten(ff_mid)), B, S)
+        hidden = _maybe_cast_activation(hidden, self.mixed_precision)
         return hidden
 
     def iter_qitnn_layers(self) -> Iterator[tuple[str, str, QITNNLinear]]:
@@ -118,6 +139,8 @@ class QITNNSimplexTransformerLM(nn.Module):
         ent_lambda_vo: float = 0.0,
         ent_lambda_ff: float = 0.0,
         init_std: float = 0.02,
+        mixed_precision: bool | None = None,
+        precision_mode: str | None = None,
         device=None,
         dtype=torch.float32,
     ) -> None:
@@ -128,6 +151,10 @@ class QITNNSimplexTransformerLM(nn.Module):
         self.seq_len = int(seq_len)
         self.layers = int(layers)
         self.hidden_dim = self.dim * 2
+        self.precision_mode, self.mixed_precision = _resolve_precision_mode_args(
+            precision_mode,
+            mixed_precision,
+        )
 
         kw = {"device": device, "dtype": dtype}
 
@@ -140,6 +167,7 @@ class QITNNSimplexTransformerLM(nn.Module):
                 ent_lambda_vo=ent_lambda_vo,
                 ent_lambda_ff=ent_lambda_ff,
                 init_std=init_std,
+                precision_mode=self.precision_mode,
                 device=device, dtype=dtype,
             )
             for _ in range(self.layers)
@@ -167,16 +195,44 @@ class QITNNSimplexTransformerLM(nn.Module):
         B, S = tokens.shape
         if S > self.seq_len:
             raise RuntimeError("sequence is longer than configured seq_len")
+        if self.mixed_precision:
+            if tokens.is_cuda and not torch.cuda.is_bf16_supported():
+                raise RuntimeError(
+                    f"precision_mode='{self.precision_mode}' currently targets CUDA bf16 visible activations. "
+                    "This GPU does not report bf16 support. "
+                    "Use precision_mode='fp32' to keep the trusted fp32 path."
+                )
+            if self.token_emb.weight.dtype != torch.float32 or self.pos_emb.dtype != torch.float32:
+                raise RuntimeError(
+                    "mixed_precision expects fp32 master weights. "
+                    "Do not call .half() or .bfloat16() on the model."
+                )
+            if self.head.weight.dtype != torch.float32 or (self.head.bias is not None and self.head.bias.dtype != torch.float32):
+                raise RuntimeError(
+                    "mixed_precision expects fp32 master weights. "
+                    "Do not call .half() or .bfloat16() on the model."
+                )
 
-        hidden = self.token_emb(tokens) + self.pos_emb[:S].unsqueeze(0)
-        for block in self.blocks:
-            hidden = block(hidden)
+        amp_ctx = (
+            torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
+            if tokens.is_cuda and self.mixed_precision
+            else (
+                torch.amp.autocast(device_type="cuda", enabled=False)
+                if tokens.is_cuda
+                else nullcontext()
+            )
+        )
+        with amp_ctx:
+            hidden = self.token_emb(tokens) + self.pos_emb[:S].unsqueeze(0)
+            hidden = _maybe_cast_activation(hidden, self.mixed_precision)
+            for block in self.blocks:
+                hidden = block(hidden)
 
-        logits = self.head(self.ln_f(hidden))
+            logits = self.head(self.ln_f(hidden))
 
-        loss = None
-        if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            loss = None
+            if targets is not None:
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
         return logits, loss
 
@@ -257,7 +313,14 @@ class QITNNSimplexTransformerLM(nn.Module):
             s = step_map[role]
             if s <= 0.0:
                 continue
-            prior_(layer.a_neg, layer.a_zero, layer.a_pos, step=s, entropy_floor=entropy_floor)
+            prior_(
+                layer.a_neg,
+                layer.a_zero,
+                layer.a_pos,
+                step=s,
+                entropy_floor=entropy_floor,
+                mixed_precision=self.mixed_precision,
+            )
 
     #====================
     # diagnostics
@@ -339,5 +402,6 @@ class QITNNSimplexTransformerLM(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"vocab_size={self.vocab_size}, dim={self.dim}, ffn_dim={self.ffn_dim}, "
-            f"seq_len={self.seq_len}, layers={self.layers}"
+            f"seq_len={self.seq_len}, layers={self.layers}, precision_mode={self.precision_mode}, "
+            f"mixed_precision={self.mixed_precision}"
         )

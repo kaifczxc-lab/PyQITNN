@@ -13,6 +13,7 @@ model = pyqitnn.QITNNSimplexTransformerLM(
     ffn_dim=128,
     seq_len=128,
     layers=2,
+    precision_mode="fp32",
     device="cuda:0",
 )
 tokens = torch.randint(0, 256, (2, 128), device="cuda:0")
@@ -84,7 +85,7 @@ pip install pyqitnn[tokenizers] --no-deps
 import pyqitnn
 
 status = pyqitnn.bridge_status()
-print(pyqitnn.__version__)        # e.g. 0.3.2
+print(pyqitnn.__version__)        # e.g. 0.3.6
 print(status["native_found"])     # True
 print(status["native_loadable"])  # True
 ```
@@ -118,6 +119,7 @@ model = pyqitnn.QITNNSimplexTransformerLM(
     ffn_dim=128,       # FFN intermediate width
     seq_len=128,       # max sequence length
     layers=2,          # transformer blocks
+    precision_mode="fp32",  # explicit trusted baseline
     device="cuda:0",
 )
 
@@ -149,6 +151,34 @@ for step in range(1000):
         entropy_floor=1.0840643,
     )
 ```
+
+### Mixed precision toggle
+
+Core `pyqitnn` modules stay on dense `fp32` unless you opt in explicitly.
+
+```python
+model = pyqitnn.QITNNSimplexTransformerLM(
+    vocab_size=256,
+    dim=64,
+    ffn_dim=128,
+    seq_len=128,
+    layers=2,
+    precision_mode="fp32",
+    device="cuda:0",
+)
+```
+
+Set `precision_mode="qts_fp32_rest_bf16"` to enable the conservative mixed path:
+
+- visible activations use CUDA autocast (`bf16`)
+- the native extension accepts `bf16/fp16` activations directly; it no longer relies on Python-side `float32` staging for mixed mode
+- QITNN master weights stay in `fp32`
+- sensitive math stays in `fp32`: Born normalization, backnorm, entropy/prior, and the attention softmax path
+- training script / CLI: use `TrainConfig(precision_mode="qts_fp32_rest_bf16")` or `--precision-mode qts_fp32_rest_bf16`
+- to force the trusted baseline explicitly from CLI, use `TrainConfig(precision_mode="fp32")`, `--precision-mode fp32`, or legacy `--no-mixed-precision`
+- legacy compatibility still exists: `mixed_precision=True` maps to `qts_fp32_rest_bf16`
+
+`BasicQITNN_Transformer.py` currently ships with `TrainConfig.precision_mode="qts_fp32_rest_bf16"` as its standalone trainer default. The lower-level `pyqitnn` modules still default to trusted `fp32` if you omit both `precision_mode` and legacy `mixed_precision`.
 
 ### Generation
 
@@ -187,6 +217,7 @@ model = pyqitnn.QITNNSimplexTransformerLM(
     ffn_dim=128,
     seq_len=128,
     layers=2,
+    precision_mode="fp32",
     device="cuda:0",
 )
 ```
@@ -319,7 +350,11 @@ opt = torch.optim.AdamW([
 
 **Hardware:**
 - Only `cuda:0` is supported. Multi-GPU requires changes to the CUDA backend.
-- FP32 only. The Born-rule division is numerically sensitive; FP16 would cause instabilities.
+- Supported precision modes today are `fp32` and `qts_fp32_rest_bf16`.
+- `precision_mode="fp32"` keeps the original all-`fp32` path.
+- `precision_mode="qts_fp32_rest_bf16"` enables a conservative CUDA `bf16` path for activations while keeping sensitive QITNN math in `fp32`.
+- Legacy `mixed_precision=True` is still accepted as a compatibility alias for `qts_fp32_rest_bf16`.
+- Do not call `.half()` or `.bfloat16()` on the model. Mixed mode expects fp32 master weights.
 
 **Architecture:**
 - Single-head attention only. Multi-head QTS attention is not implemented.

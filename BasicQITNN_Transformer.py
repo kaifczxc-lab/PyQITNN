@@ -60,7 +60,7 @@ class TrainConfig:
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
     test_dir: str | Path | None = None
-    max_bytes: int = 50_000_000       # max bytes to load per data source
+    max_bytes: int = 10_000_000       # max bytes to load per data source
     data_format: str = "auto"         # "auto", "text", "json", "jsonl"
     json_text_fields: str | None = None   # comma-separated preferred text fields, e.g. "text,content"
     tokenizer: str = "bpe"           # "byte" or "bpe"
@@ -86,6 +86,8 @@ class TrainConfig:
     epochs: int = 20
     steps_per_epoch: int = 2000
     grad_clip: float = 1.0
+    mixed_precision: bool | None = None   # legacy compatibility knob
+    precision_mode: str | None = "qts_fp32_rest_bf16"    # None = resolve from mixed_precision or default fp32
     #====================
     # optimizer
     # "adamw" and "SGD"
@@ -176,6 +178,35 @@ class TrainConfig:
     interactive: bool = False        # force interactive prompt loop after training
     no_interactive: bool = False     # force non-interactive
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+_PRECISION_MODE_ALIASES = {
+    "mixed_bf16_native": "qts_fp32_rest_bf16",
+    "bf16": "qts_fp32_rest_bf16",
+}
+_PRECISION_MODE_SET = {"fp32", "qts_fp32_rest_bf16"}
+
+
+def _normalize_precision_mode(value: str) -> str:
+    mode = value.strip().lower()
+    mode = _PRECISION_MODE_ALIASES.get(mode, mode)
+    if mode not in _PRECISION_MODE_SET:
+        wanted = ", ".join(sorted(_PRECISION_MODE_SET))
+        raise RuntimeError(f"precision_mode must be one of: {wanted}")
+    return mode
+
+
+def _resolve_precision_mode_cfg(cfg: TrainConfig) -> tuple[str, bool]:
+    mode = "fp32" if cfg.precision_mode is None else _normalize_precision_mode(str(cfg.precision_mode))
+    if cfg.mixed_precision is not None:
+        legacy_mode = "qts_fp32_rest_bf16" if bool(cfg.mixed_precision) else "fp32"
+        if cfg.precision_mode is None:
+            mode = legacy_mode
+        elif legacy_mode != mode:
+            raise RuntimeError(
+                "mixed_precision and precision_mode conflict. "
+                "Use precision_mode alone, or keep them aligned during migration."
+            )
+    return mode, mode != "fp32"
 
 #====================
 # data loading
@@ -540,9 +571,16 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         for k, v in kwargs.items():
             setattr(cfg, k, v)
 
+    precision_mode, use_mixed_precision = _resolve_precision_mode_cfg(cfg)
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
     device = torch.device(cfg.device)
+    if use_mixed_precision and not torch.cuda.is_bf16_supported():
+        raise RuntimeError(
+            f"precision_mode='{precision_mode}' currently requires CUDA bf16 support on this device. "
+            "Use precision_mode='fp32' to keep the trusted fp32 path."
+        )
     #====================
     # seed
     #====================
@@ -654,6 +692,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         ent_lambda_qk=el_qk,
         ent_lambda_vo=el_vo,
         ent_lambda_ff=el_ff,
+        precision_mode=precision_mode,
         device=device,
         dtype=torch.float32,
     ).to(device)
@@ -735,6 +774,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
                        for k, v in asdict(cfg).items()}
         config_dict["run_dir"] = str(run_dir)
         config_dict["params"] = n_params
+        config_dict["precision_mode_resolved"] = precision_mode
         config_dict["tokenizer_summary"] = tokenizer.summary()
         config_dict["tokenizer_asset"] = str(tokenizer_asset)
         (run_dir / "config.json").write_text(
@@ -758,6 +798,8 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         print(f"test_tokens   {test_data.numel()}")
     print(f"params        {n_params:,}")
     print(f"optimizer     {cfg.optimizer}")
+    print(f"mixed_prec    {use_mixed_precision}")
+    print(f"precision_mode {precision_mode}")
     print(f"lr            {lr_start} -> {lr_end}  ({cfg.lr_schedule})")
     print(f"seed          {cfg.seed}")
     if run_dir is not None:
@@ -991,6 +1033,8 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         "last_epoch_train_tok_s": last_epoch_train_tok_s,
         "last_epoch_val_tok_s": last_epoch_val_tok_s,
         "run_dir": str(run_dir) if run_dir else None,
+        "precision_mode": precision_mode,
+        "mixed_precision": use_mixed_precision,
         "model": model,
         "tokenizer": tokenizer,
     }
@@ -999,8 +1043,9 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
 #====================
 # CLI
 #====================
-def _parse_cli() -> TrainConfig:
+def _parse_cli(args: list[str] | None = None) -> TrainConfig:
     D = TrainConfig()
+    arg_list = sys.argv[1:] if args is None else list(args)
     p = argparse.ArgumentParser(description="pyqitnn transformer training")
     # data
     p.add_argument("--dataset",           type=str,   default=D.dataset)
@@ -1028,6 +1073,9 @@ def _parse_cli() -> TrainConfig:
     p.add_argument("--epochs",           type=int,   default=D.epochs)
     p.add_argument("--steps-per-epoch",  type=int,   default=D.steps_per_epoch)
     p.add_argument("--grad-clip",        type=float, default=D.grad_clip)
+    p.add_argument("--precision-mode",   type=str,   default=D.precision_mode)
+    p.add_argument("--mixed-precision",     dest="mixed_precision", action="store_true",  default=D.mixed_precision)
+    p.add_argument("--no-mixed-precision",  dest="mixed_precision", action="store_false")
     # optimizer
     p.add_argument("--optimizer",    type=str,   default=D.optimizer, choices=("sgd", "adamw"))
     p.add_argument("--lr-start",     type=float, default=D.lr_start)
@@ -1091,7 +1139,11 @@ def _parse_cli() -> TrainConfig:
     p.add_argument("--interactive",     action="store_true")
     p.add_argument("--no-interactive",  action="store_true")
 
-    a = p.parse_args()
+    a = p.parse_args(args=arg_list)
+    saw_precision_mode = "--precision-mode" in arg_list
+    saw_legacy_precision_flag = ("--mixed-precision" in arg_list) or ("--no-mixed-precision" in arg_list)
+    if saw_legacy_precision_flag and not saw_precision_mode:
+        a.precision_mode = None
     return TrainConfig(**{
         k.replace("-", "_"): v for k, v in vars(a).items()
     })

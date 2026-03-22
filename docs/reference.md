@@ -36,7 +36,9 @@ PyQITNN exposes the following public symbols:
 
 - NVIDIA GPU (CUDA, device `cuda:0` only)
 - PyTorch >= 2.0 with CUDA support
-- float32 only (no mixed precision)
+- Core library default path is full `float32`
+- Canonical mixed mode is `precision_mode="qts_fp32_rest_bf16"`
+- Legacy `mixed_precision=True` is still accepted as a compatibility alias
 - Windows or Linux
 - Python >= 3.10
 
@@ -48,12 +50,14 @@ PyQITNN exposes the following public symbols:
 
 ```python
 pyqitnn.forward3(
-    inp: torch.Tensor,       # [M, in_dim], float32, CUDA, contiguous
+    inp: torch.Tensor,       # [M, in_dim], float32 by default; fp16/bf16 allowed when precision_mode="qts_fp32_rest_bf16"
     a_neg: torch.Tensor,     # [in_dim, out_dim], float32, CUDA, contiguous
     a_zero: torch.Tensor,    # [in_dim, out_dim], float32, CUDA, contiguous
     a_pos: torch.Tensor,     # [in_dim, out_dim], float32, CUDA, contiguous
     *,
     ent_lambda: float = 0.0,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,     # "fp32" | "qts_fp32_rest_bf16"
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
 ```
 
@@ -132,7 +136,9 @@ dcp -= ent_lambda * 2c * (a2*(log(P_neg) - log(P_pos)) + b2*(log(P_zero) - log(P
 
 **Constraints:**
 
-- All tensors must be 2D, float32, CUDA, contiguous, on device cuda:0.
+- All tensors must be 2D, CUDA, contiguous, on device cuda:0.
+- Default path is full `float32`.
+- With `precision_mode="qts_fp32_rest_bf16"` or legacy `mixed_precision=True`, `inp` may be `float16` or `bfloat16`, but QITNN weights stay `float32` and the Born-rule math still computes in `float32`.
 - `inp.size(1)` must equal `a_neg.size(0)`.
 - `a_neg`, `a_zero`, `a_pos` must have the same shape.
 
@@ -160,8 +166,11 @@ loss.backward()
 
 ```python
 pyqitnn.centered_simplex(
-    u: torch.Tensor,    # [M, D], float32, CUDA, contiguous
-    v: torch.Tensor,    # [M, D], float32, CUDA, contiguous
+    u: torch.Tensor,    # [M, D], float32 by default; fp16/bf16 allowed when precision_mode="qts_fp32_rest_bf16"
+    v: torch.Tensor,    # [M, D], float32 by default; fp16/bf16 allowed when precision_mode="qts_fp32_rest_bf16"
+    *,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]
 ```
 
@@ -220,9 +229,12 @@ x, y = pyqitnn.centered_simplex(u, v)
 
 ```python
 pyqitnn.attention2(
-    q: torch.Tensor,    # [S, D] or [B, S, D], float32, CUDA, contiguous
+    q: torch.Tensor,    # [S, D] or [B, S, D], float32 by default; fp16/bf16 allowed when precision_mode="qts_fp32_rest_bf16"
     k: torch.Tensor,    # same shape as q
     v: torch.Tensor,    # same shape as q
+    *,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,
 ) -> torch.Tensor       # same shape as q
 ```
 
@@ -299,12 +311,14 @@ out.sum().backward()
 
 ```python
 pyqitnn.prior_(
-    a_neg: torch.Tensor,     # [*, *], float32, CUDA, contiguous, MODIFIED IN-PLACE
+    a_neg: torch.Tensor,     # [*, *], float32 by default; fp16/bf16 allowed when precision_mode="qts_fp32_rest_bf16"
     a_zero: torch.Tensor,    # same shape as a_neg, MODIFIED IN-PLACE
     a_pos: torch.Tensor,     # same shape as a_neg, MODIFIED IN-PLACE
     *,
     step: float,
     entropy_floor: float,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ```
 
@@ -372,6 +386,8 @@ pyqitnn.QITNNLinear(
     pack_output: bool = True,
     centered_simplex: bool = True,
     return_triplet: bool = False,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,     # "fp32" | "qts_fp32_rest_bf16"
     device=None,
     dtype=torch.float32,
 )
@@ -396,8 +412,10 @@ amplitude matrices and Born normalization.
 | `pack_output` | bool | True | Pack `[x, y]` into one tensor. | `True`: output is `[M, 2*out_dim]`, one tensor. `False`: output is `(x, y)`, two separate tensors of `[M, out_dim]` each. Pack mode is what the transformer expects. |
 | `centered_simplex` | bool | True | Apply the centered simplex transform. | `True`: convert `(u,v)` -> `(x,y)` via `x=u, y=sqrt(3)*v - 1/sqrt(3)`. This gives equilateral triangle geometry. `False`: return raw Born-rule `(u,v)` directly. |
 | `return_triplet` | bool | False | Also return the raw channels. | `True`: forward returns `(output, (cn, cz, cp))` -- useful for diagnostics. `False`: forward returns just the output. |
+| `mixed_precision` | bool or None | None | Legacy compatibility alias. | `True` maps to `precision_mode="qts_fp32_rest_bf16"`. `False` maps to `precision_mode="fp32"`. Leave `None` when you use `precision_mode` directly. |
+| `precision_mode` | str or None | None | Canonical precision selector. | Supported modes are `"fp32"` and `"qts_fp32_rest_bf16"`. The mixed mode keeps QITNN master weights and sensitive Born-rule math in `fp32` while allowing visible activations on the conservative CUDA mixed path. |
 | `device` | | None | Device for parameter allocation. | `None` puts params on CPU (you must `.cuda()` later). `"cuda:0"` puts them on GPU directly. |
-| `dtype` | | float32 | Data type for parameters. | Only float32 is supported by the CUDA kernels. Don't change this. |
+| `dtype` | | float32 | Data type for parameters. | Keep this at `float32`. Mixed mode expects fp32 master weights; do not call `.half()` or `.bfloat16()` on QITNN parameters. |
 
 **Learnable parameters:**
 
@@ -471,6 +489,8 @@ pyqitnn.QITNNSimplexTransformerLM(
     ent_lambda_vo: float = 0.0,
     ent_lambda_ff: float = 0.0,
     init_std: float = 0.02,
+    mixed_precision: bool | None = None,   # legacy compatibility alias
+    precision_mode: str | None = None,     # "fp32" | "qts_fp32_rest_bf16"
     device=None,
     dtype=torch.float32,
 )
@@ -491,6 +511,8 @@ Complete byte-level autoregressive transformer using QTS projections.
 | `ent_lambda_vo` | float | 0.0 | Entropy regularization for V and O projections. | Same logic as `ent_lambda_qk`. |
 | `ent_lambda_ff` | float | 0.0 | Entropy regularization for FF1 and FF2 projections. | Same logic. |
 | `init_std` | float | 0.02 | Standard deviation for all parameter initialization. | Applies to amplitude matrices, embeddings, and output head. |
+| `mixed_precision` | bool or None | None | Legacy compatibility alias. | `True` maps to `precision_mode="qts_fp32_rest_bf16"`. `False` maps to `precision_mode="fp32"`. |
+| `precision_mode` | str or None | None | Canonical precision selector. | Supported modes are `"fp32"` and `"qts_fp32_rest_bf16"`. The mixed mode keeps visible activations on the conservative CUDA `bf16` path while preserving `fp32` master weights and sensitive math. |
 
 **Internal dimensions:**
 
@@ -960,6 +982,8 @@ and what happens when you change it.
 | `steps_per_epoch` | int | `1000` | Steps per epoch. | Total training steps = `epochs * steps_per_epoch`. Each step processes one batch. |
 | `steps` | int or None | `None` | Total step override. | When set, overrides `epochs` and `steps_per_epoch`. Runs exactly N steps in a single "epoch". Useful for fine-grained control. |
 | `grad_clip` | float | `1.0` | Maximum gradient norm. | `0.0` = no clipping. `1.0` = recommended for AdamW, prevents gradient explosions. Values like `0.5` are more aggressive. |
+| `mixed_precision` | bool or None | `None` | Legacy compatibility alias. | `True` maps to `precision_mode="qts_fp32_rest_bf16"`. `False` maps to `precision_mode="fp32"`. In the standalone trainer this field remains for backward compatibility with older launch scripts. |
+| `precision_mode` | str or None | `"qts_fp32_rest_bf16"` | Canonical trainer precision selector. | Supported modes are `"fp32"` and `"qts_fp32_rest_bf16"`. In the current standalone `BasicQITNN_Transformer.py`, the default resolves to the conservative mixed path unless you override it with `precision_mode="fp32"` or legacy `--no-mixed-precision`. |
 
 #### Optimizer
 
@@ -1290,8 +1314,12 @@ python stress_test.py
 1. **Single device only.** All tensors must be on `cuda:0`. The extension
    explicitly checks `get_device() == 0` for every input. No multi-GPU support.
 
-2. **FP32 only.** No mixed precision, no FP16/BF16. `torch.autocast` will cause
-   dtype mismatch errors. The Born-rule division is precision-sensitive.
+2. **Mixed precision is conservative.** Canonical mixed mode is
+   `precision_mode="qts_fp32_rest_bf16"`. Legacy `mixed_precision=True`
+   still maps to the same path. This keeps QITNN master weights, Born
+   normalization, backnorm, entropy/prior, and the attention softmax path in
+   `fp32` while allowing visible activations on the CUDA `bf16` path. Do not
+   call `.half()` or `.bfloat16()` on the model itself.
 
 3. **Windows and Linux only.** No macOS support (requires NVIDIA CUDA).
 
@@ -1320,11 +1348,3 @@ python stress_test.py
    large batch sizes, per-sample overhead may be noticeable.
 
 ---
-
-## Version history
-
-| Version | Changes |
-|---------|---------|
-| 0.3.0 | Fixed AdamW per-role zero-boost bug. Fixed silent build fallback. Added CUDA-required check in QITNNLinear. Improved bridge_status() with actual load verification. Updated metadata for PyPI. Auto-detect GPU architectures in setup.py. |
-| 0.2.0 | Renamed to PyQITNN. Cross-platform support (Linux). Single-command install. Refactored ops, modules, diagnostics, and testing workflow. |
-| 0.1.0 | Initial release. Windows-only. forward3, backnorm3, prior, centered_simplex, attention2. QITNNLinear module. Basic transformer. |

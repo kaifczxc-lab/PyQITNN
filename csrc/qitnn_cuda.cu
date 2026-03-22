@@ -6,6 +6,8 @@
 #include "qitnn/qitnn_device.h"
 
 #include <cublas_v2.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -35,6 +37,58 @@ float* g_scores = nullptr;
 size_t g_scores_cap = 0;
 float* g_loss = nullptr;
 size_t g_loss_cap = 0;
+
+template <typename T>
+__device__ inline float qitnn_to_float(T value);
+
+template <>
+__device__ inline float qitnn_to_float<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ inline float qitnn_to_float<__half>(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ inline float qitnn_to_float<__nv_bfloat16>(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <typename T>
+__device__ inline T qitnn_from_float(float value);
+
+template <>
+__device__ inline float qitnn_from_float<float>(float value) {
+    return value;
+}
+
+template <>
+__device__ inline __half qitnn_from_float<__half>(float value) {
+    return __float2half(value);
+}
+
+template <>
+__device__ inline __nv_bfloat16 qitnn_from_float<__nv_bfloat16>(float value) {
+    return __float2bfloat16(value);
+}
+
+template <typename SrcT>
+__global__ void qitnn_cast_to_float_k(const SrcT* src, float* dst, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        dst[i] = qitnn_to_float(src[i]);
+    }
+}
+
+template <typename DstT>
+__global__ void qitnn_cast_from_float_k(const float* src, DstT* dst, int n) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i < n) {
+        dst[i] = qitnn_from_float<DstT>(src[i]);
+    }
+}
 
 void qitnn_report(cudaError_t err, const char* op, int line) {
     if (err == cudaSuccess) {
@@ -184,6 +238,105 @@ float* qitnn_ensure_buffer(float*& ptr, size_t& cap, size_t bytes) {
     QITNN_CU(cudaMalloc(&ptr, bytes));
     cap = bytes;
     return ptr;
+}
+
+bool qitnn_valid_dtype(int dtype) {
+    return dtype == QITNN_DTYPE_FLOAT32 || dtype == QITNN_DTYPE_FLOAT16 || dtype == QITNN_DTYPE_BFLOAT16;
+}
+
+float* qitnn_alloc_temp_float(int count) {
+    if (count <= 0) {
+        return nullptr;
+    }
+    float* ptr = nullptr;
+    QITNN_CU(cudaMalloc(&ptr, (size_t)count * sizeof(float)));
+    return ptr;
+}
+
+void qitnn_release_temp_float(float*& ptr) {
+    if (ptr != nullptr) {
+        QITNN_CU(cudaFree(ptr));
+        ptr = nullptr;
+    }
+}
+
+void qitnn_cast_to_float(const void* src, int dtype, float* dst, int count) {
+    if (count <= 0 || src == nullptr || dst == nullptr) {
+        return;
+    }
+    switch (dtype) {
+        case QITNN_DTYPE_FLOAT32:
+            QITNN_CU(cudaMemcpy(dst, src, (size_t)count * sizeof(float), cudaMemcpyDeviceToDevice));
+            break;
+        case QITNN_DTYPE_FLOAT16:
+            qitnn_cast_to_float_k<<<(count + 255) / 256, 256>>>(
+                static_cast<const __half*>(src), dst, count
+            );
+            QITNN_CU(cudaGetLastError());
+            break;
+        case QITNN_DTYPE_BFLOAT16:
+            qitnn_cast_to_float_k<<<(count + 255) / 256, 256>>>(
+                static_cast<const __nv_bfloat16*>(src), dst, count
+            );
+            QITNN_CU(cudaGetLastError());
+            break;
+        default:
+            std::fprintf(stderr, "[libQITNN] unsupported dtype code for qitnn_cast_to_float: %d\n", dtype);
+            break;
+    }
+}
+
+void qitnn_cast_from_float(const float* src, int dtype, void* dst, int count) {
+    if (count <= 0 || src == nullptr || dst == nullptr) {
+        return;
+    }
+    switch (dtype) {
+        case QITNN_DTYPE_FLOAT32:
+            QITNN_CU(cudaMemcpy(dst, src, (size_t)count * sizeof(float), cudaMemcpyDeviceToDevice));
+            break;
+        case QITNN_DTYPE_FLOAT16:
+            qitnn_cast_from_float_k<<<(count + 255) / 256, 256>>>(
+                src, static_cast<__half*>(dst), count
+            );
+            QITNN_CU(cudaGetLastError());
+            break;
+        case QITNN_DTYPE_BFLOAT16:
+            qitnn_cast_from_float_k<<<(count + 255) / 256, 256>>>(
+                src, static_cast<__nv_bfloat16*>(dst), count
+            );
+            QITNN_CU(cudaGetLastError());
+            break;
+        default:
+            std::fprintf(stderr, "[libQITNN] unsupported dtype code for qitnn_cast_from_float: %d\n", dtype);
+            break;
+    }
+}
+
+const float* qitnn_prepare_read_f32(const void* src, int dtype, int count, float*& owned_tmp) {
+    owned_tmp = nullptr;
+    if (dtype == QITNN_DTYPE_FLOAT32) {
+        return static_cast<const float*>(src);
+    }
+    owned_tmp = qitnn_alloc_temp_float(count);
+    qitnn_cast_to_float(src, dtype, owned_tmp, count);
+    return owned_tmp;
+}
+
+float* qitnn_prepare_write_f32(void* dst, int dtype, int count, float*& owned_tmp) {
+    owned_tmp = nullptr;
+    if (dtype == QITNN_DTYPE_FLOAT32) {
+        return static_cast<float*>(dst);
+    }
+    owned_tmp = qitnn_alloc_temp_float(count);
+    return owned_tmp;
+}
+
+void qitnn_commit_write_f32(void* dst, int dtype, int count, float*& owned_tmp) {
+    if (owned_tmp == nullptr) {
+        return;
+    }
+    qitnn_cast_from_float(owned_tmp, dtype, dst, count);
+    qitnn_release_temp_float(owned_tmp);
 }
 
 __global__ void qitnn_matmul_k(const float* a, const float* b, float* c, int rows, int cols, int inner) {
@@ -1483,4 +1636,335 @@ extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2(
     QITNN_CU(cudaFree(d_attn));
     QITNN_CU(cudaFree(d_tmp_attn));
     QITNN_CU(cudaFree(d_scores));
+}
+
+extern "C" QITNN_API void Qitnn_DeviceForward3Ex(
+    const void* d_input,
+    int input_dtype,
+    const float* d_a_neg,
+    const float* d_a_zero,
+    const float* d_a_pos,
+    void* d_out_u,
+    void* d_out_v,
+    int uv_dtype,
+    float* d_out_cn,
+    float* d_out_cz,
+    float* d_out_cp,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    if (!qitnn_valid_dtype(input_dtype) || !qitnn_valid_dtype(uv_dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceForward3Ex received unsupported dtype\n");
+        return;
+    }
+
+    const int in_count = rows * in_dim;
+    const int out_count = rows * out_dim;
+
+    float* tmp_in = nullptr;
+    float* tmp_u = nullptr;
+    float* tmp_v = nullptr;
+    const float* d_input_f = qitnn_prepare_read_f32(d_input, input_dtype, in_count, tmp_in);
+    float* d_out_u_f = qitnn_prepare_write_f32(d_out_u, uv_dtype, out_count, tmp_u);
+    float* d_out_v_f = qitnn_prepare_write_f32(d_out_v, uv_dtype, out_count, tmp_v);
+
+    Qitnn_DeviceForward3(
+        const_cast<float*>(d_input_f),
+        const_cast<float*>(d_a_neg),
+        const_cast<float*>(d_a_zero),
+        const_cast<float*>(d_a_pos),
+        d_out_u_f,
+        d_out_v_f,
+        d_out_cn,
+        d_out_cz,
+        d_out_cp,
+        rows,
+        in_dim,
+        out_dim
+    );
+
+    qitnn_commit_write_f32(d_out_u, uv_dtype, out_count, tmp_u);
+    qitnn_commit_write_f32(d_out_v, uv_dtype, out_count, tmp_v);
+    qitnn_release_temp_float(tmp_in);
+}
+
+extern "C" QITNN_API void Qitnn_DeviceBackNorm3Ex(
+    const void* d_du,
+    const void* d_dv,
+    int grad_dtype,
+    const float* d_cn,
+    const float* d_cz,
+    const float* d_cp,
+    float* d_dcn,
+    float* d_dcz,
+    float* d_dcp,
+    float ent_lambda,
+    int count
+) {
+    if (!qitnn_valid_dtype(grad_dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceBackNorm3Ex received unsupported dtype\n");
+        return;
+    }
+
+    float* tmp_du = nullptr;
+    float* tmp_dv = nullptr;
+    const float* d_du_f = qitnn_prepare_read_f32(d_du, grad_dtype, count, tmp_du);
+    const float* d_dv_f = qitnn_prepare_read_f32(d_dv, grad_dtype, count, tmp_dv);
+
+    Qitnn_DeviceBackNorm3(
+        const_cast<float*>(d_du_f),
+        const_cast<float*>(d_dv_f),
+        const_cast<float*>(d_cn),
+        const_cast<float*>(d_cz),
+        const_cast<float*>(d_cp),
+        d_dcn,
+        d_dcz,
+        d_dcp,
+        ent_lambda,
+        count
+    );
+
+    qitnn_release_temp_float(tmp_du);
+    qitnn_release_temp_float(tmp_dv);
+}
+
+extern "C" QITNN_API void Qitnn_DevicePriorEx(
+    void* d_an,
+    void* d_az,
+    void* d_ap,
+    int dtype,
+    float step,
+    float entropy_floor,
+    int count
+) {
+    if (!qitnn_valid_dtype(dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DevicePriorEx received unsupported dtype\n");
+        return;
+    }
+
+    float* tmp_an_in = nullptr;
+    float* tmp_az_in = nullptr;
+    float* tmp_ap_in = nullptr;
+    const float* d_an_f = qitnn_prepare_read_f32(d_an, dtype, count, tmp_an_in);
+    const float* d_az_f = qitnn_prepare_read_f32(d_az, dtype, count, tmp_az_in);
+    const float* d_ap_f = qitnn_prepare_read_f32(d_ap, dtype, count, tmp_ap_in);
+
+    float* tmp_an_out = nullptr;
+    float* tmp_az_out = nullptr;
+    float* tmp_ap_out = nullptr;
+    float* d_an_out_f = qitnn_prepare_write_f32(d_an, dtype, count, tmp_an_out);
+    float* d_az_out_f = qitnn_prepare_write_f32(d_az, dtype, count, tmp_az_out);
+    float* d_ap_out_f = qitnn_prepare_write_f32(d_ap, dtype, count, tmp_ap_out);
+
+    if (tmp_an_out != nullptr) {
+        QITNN_CU(cudaMemcpy(d_an_out_f, d_an_f, (size_t)count * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+    if (tmp_az_out != nullptr) {
+        QITNN_CU(cudaMemcpy(d_az_out_f, d_az_f, (size_t)count * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+    if (tmp_ap_out != nullptr) {
+        QITNN_CU(cudaMemcpy(d_ap_out_f, d_ap_f, (size_t)count * sizeof(float), cudaMemcpyDeviceToDevice));
+    }
+
+    Qitnn_DevicePrior(d_an_out_f, d_az_out_f, d_ap_out_f, step, entropy_floor, count);
+
+    qitnn_commit_write_f32(d_an, dtype, count, tmp_an_out);
+    qitnn_commit_write_f32(d_az, dtype, count, tmp_az_out);
+    qitnn_commit_write_f32(d_ap, dtype, count, tmp_ap_out);
+    qitnn_release_temp_float(tmp_an_in);
+    qitnn_release_temp_float(tmp_az_in);
+    qitnn_release_temp_float(tmp_ap_in);
+}
+
+extern "C" QITNN_API void Qitnn_DeviceCenteredSimplexEx(
+    const void* d_u,
+    const void* d_v,
+    int in_dtype,
+    void* d_out_x,
+    void* d_out_y,
+    int out_dtype,
+    int count
+) {
+    if (!qitnn_valid_dtype(in_dtype) || !qitnn_valid_dtype(out_dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceCenteredSimplexEx received unsupported dtype\n");
+        return;
+    }
+
+    float* tmp_u = nullptr;
+    float* tmp_v = nullptr;
+    const float* d_u_f = qitnn_prepare_read_f32(d_u, in_dtype, count, tmp_u);
+    const float* d_v_f = qitnn_prepare_read_f32(d_v, in_dtype, count, tmp_v);
+
+    float* tmp_x = nullptr;
+    float* tmp_y = nullptr;
+    float* d_out_x_f = qitnn_prepare_write_f32(d_out_x, out_dtype, count, tmp_x);
+    float* d_out_y_f = qitnn_prepare_write_f32(d_out_y, out_dtype, count, tmp_y);
+
+    Qitnn_DeviceCenteredSimplex(
+        const_cast<float*>(d_u_f),
+        const_cast<float*>(d_v_f),
+        d_out_x_f,
+        d_out_y_f,
+        count
+    );
+
+    qitnn_commit_write_f32(d_out_x, out_dtype, count, tmp_x);
+    qitnn_commit_write_f32(d_out_y, out_dtype, count, tmp_y);
+    qitnn_release_temp_float(tmp_u);
+    qitnn_release_temp_float(tmp_v);
+}
+
+extern "C" QITNN_API void Qitnn_DeviceAttention2Ex(
+    const void* d_qx,
+    const void* d_qy,
+    const void* d_kx,
+    const void* d_ky,
+    const void* d_vx,
+    const void* d_vy,
+    int dtype,
+    void* d_ox,
+    void* d_oy,
+    int out_dtype,
+    int seq_len,
+    int dim
+) {
+    if (!qitnn_valid_dtype(dtype) || !qitnn_valid_dtype(out_dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttention2Ex received unsupported dtype\n");
+        return;
+    }
+
+    const int count = seq_len * dim;
+
+    float* tmp_qx = nullptr;
+    float* tmp_qy = nullptr;
+    float* tmp_kx = nullptr;
+    float* tmp_ky = nullptr;
+    float* tmp_vx = nullptr;
+    float* tmp_vy = nullptr;
+    const float* d_qx_f = qitnn_prepare_read_f32(d_qx, dtype, count, tmp_qx);
+    const float* d_qy_f = qitnn_prepare_read_f32(d_qy, dtype, count, tmp_qy);
+    const float* d_kx_f = qitnn_prepare_read_f32(d_kx, dtype, count, tmp_kx);
+    const float* d_ky_f = qitnn_prepare_read_f32(d_ky, dtype, count, tmp_ky);
+    const float* d_vx_f = qitnn_prepare_read_f32(d_vx, dtype, count, tmp_vx);
+    const float* d_vy_f = qitnn_prepare_read_f32(d_vy, dtype, count, tmp_vy);
+
+    float* tmp_ox = nullptr;
+    float* tmp_oy = nullptr;
+    float* d_ox_f = qitnn_prepare_write_f32(d_ox, out_dtype, count, tmp_ox);
+    float* d_oy_f = qitnn_prepare_write_f32(d_oy, out_dtype, count, tmp_oy);
+
+    Qitnn_DeviceAttention2(
+        const_cast<float*>(d_qx_f),
+        const_cast<float*>(d_qy_f),
+        const_cast<float*>(d_kx_f),
+        const_cast<float*>(d_ky_f),
+        const_cast<float*>(d_vx_f),
+        const_cast<float*>(d_vy_f),
+        d_ox_f,
+        d_oy_f,
+        seq_len,
+        dim
+    );
+
+    qitnn_commit_write_f32(d_ox, out_dtype, count, tmp_ox);
+    qitnn_commit_write_f32(d_oy, out_dtype, count, tmp_oy);
+    qitnn_release_temp_float(tmp_qx);
+    qitnn_release_temp_float(tmp_qy);
+    qitnn_release_temp_float(tmp_kx);
+    qitnn_release_temp_float(tmp_ky);
+    qitnn_release_temp_float(tmp_vx);
+    qitnn_release_temp_float(tmp_vy);
+}
+
+extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2Ex(
+    void* d_dqx,
+    void* d_dqy,
+    void* d_dkx,
+    void* d_dky,
+    void* d_dvx,
+    void* d_dvy,
+    int out_dtype,
+    const void* d_qx,
+    const void* d_qy,
+    const void* d_kx,
+    const void* d_ky,
+    const void* d_vx,
+    const void* d_vy,
+    const void* d_dox,
+    const void* d_doy,
+    int in_dtype,
+    int seq_len,
+    int dim
+) {
+    if (!qitnn_valid_dtype(in_dtype) || !qitnn_valid_dtype(out_dtype)) {
+        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttentionBackward2Ex received unsupported dtype\n");
+        return;
+    }
+
+    const int count = seq_len * dim;
+
+    float* tmp_qx = nullptr;
+    float* tmp_qy = nullptr;
+    float* tmp_kx = nullptr;
+    float* tmp_ky = nullptr;
+    float* tmp_vx = nullptr;
+    float* tmp_vy = nullptr;
+    float* tmp_dox = nullptr;
+    float* tmp_doy = nullptr;
+    const float* d_qx_f = qitnn_prepare_read_f32(d_qx, in_dtype, count, tmp_qx);
+    const float* d_qy_f = qitnn_prepare_read_f32(d_qy, in_dtype, count, tmp_qy);
+    const float* d_kx_f = qitnn_prepare_read_f32(d_kx, in_dtype, count, tmp_kx);
+    const float* d_ky_f = qitnn_prepare_read_f32(d_ky, in_dtype, count, tmp_ky);
+    const float* d_vx_f = qitnn_prepare_read_f32(d_vx, in_dtype, count, tmp_vx);
+    const float* d_vy_f = qitnn_prepare_read_f32(d_vy, in_dtype, count, tmp_vy);
+    const float* d_dox_f = qitnn_prepare_read_f32(d_dox, in_dtype, count, tmp_dox);
+    const float* d_doy_f = qitnn_prepare_read_f32(d_doy, in_dtype, count, tmp_doy);
+
+    float* tmp_dqx = nullptr;
+    float* tmp_dqy = nullptr;
+    float* tmp_dkx = nullptr;
+    float* tmp_dky = nullptr;
+    float* tmp_dvx = nullptr;
+    float* tmp_dvy = nullptr;
+    float* d_dqx_f = qitnn_prepare_write_f32(d_dqx, out_dtype, count, tmp_dqx);
+    float* d_dqy_f = qitnn_prepare_write_f32(d_dqy, out_dtype, count, tmp_dqy);
+    float* d_dkx_f = qitnn_prepare_write_f32(d_dkx, out_dtype, count, tmp_dkx);
+    float* d_dky_f = qitnn_prepare_write_f32(d_dky, out_dtype, count, tmp_dky);
+    float* d_dvx_f = qitnn_prepare_write_f32(d_dvx, out_dtype, count, tmp_dvx);
+    float* d_dvy_f = qitnn_prepare_write_f32(d_dvy, out_dtype, count, tmp_dvy);
+
+    Qitnn_DeviceAttentionBackward2(
+        d_dqx_f,
+        d_dqy_f,
+        d_dkx_f,
+        d_dky_f,
+        d_dvx_f,
+        d_dvy_f,
+        const_cast<float*>(d_qx_f),
+        const_cast<float*>(d_qy_f),
+        const_cast<float*>(d_kx_f),
+        const_cast<float*>(d_ky_f),
+        const_cast<float*>(d_vx_f),
+        const_cast<float*>(d_vy_f),
+        const_cast<float*>(d_dox_f),
+        const_cast<float*>(d_doy_f),
+        seq_len,
+        dim
+    );
+
+    qitnn_commit_write_f32(d_dqx, out_dtype, count, tmp_dqx);
+    qitnn_commit_write_f32(d_dqy, out_dtype, count, tmp_dqy);
+    qitnn_commit_write_f32(d_dkx, out_dtype, count, tmp_dkx);
+    qitnn_commit_write_f32(d_dky, out_dtype, count, tmp_dky);
+    qitnn_commit_write_f32(d_dvx, out_dtype, count, tmp_dvx);
+    qitnn_commit_write_f32(d_dvy, out_dtype, count, tmp_dvy);
+    qitnn_release_temp_float(tmp_qx);
+    qitnn_release_temp_float(tmp_qy);
+    qitnn_release_temp_float(tmp_kx);
+    qitnn_release_temp_float(tmp_ky);
+    qitnn_release_temp_float(tmp_vx);
+    qitnn_release_temp_float(tmp_vy);
+    qitnn_release_temp_float(tmp_dox);
+    qitnn_release_temp_float(tmp_doy);
 }

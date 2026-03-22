@@ -5,11 +5,15 @@ Designed to expose hidden bugs before public release.
 Run: python stress_test.py
 Requires CUDA GPU.
 """
+from contextlib import nullcontext
 import json
+import shutil
+import subprocess
 import sys
 import math
 import time
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -18,7 +22,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import pyqitnn
-from BasicQITNN_Transformer import load_bytes, train
+from BasicQITNN_Transformer import TrainConfig, _parse_cli, _resolve_precision_mode_cfg, load_bytes, train
 from pyqitnn.ops import forward3, prior_, centered_simplex, attention2
 from pyqitnn.bridge import load_native
 
@@ -42,6 +46,21 @@ def warn(name, detail=""):
     global WARNED
     WARNED += 1
     print(f"  [WARN] {name} -- {detail}")
+
+
+def capture_runtime_error(fn):
+    try:
+        fn()
+    except RuntimeError as e:
+        return str(e)
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+    return ""
+
+
+def cleanup_tree(path: Path):
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
 
 import pyqitnn
 
@@ -689,7 +708,517 @@ def test_generation_sanity():
 
 
 #====================
-# 16. Memory stability: repeated forward/backward does not OOM or leak
+# 16. Mixed generation: inference path must stay on the conservative bf16 contract
+#====================
+
+def test_mixed_precision_generation_sanity():
+    """mixed generation should keep bf16 visible activations and emit valid guarded tokens"""
+    print("\n=== test_mixed_precision_generation_sanity ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed generation skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(42)
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=32, ffn_dim=64, seq_len=64, layers=2, device=DEVICE, mixed_precision=True,
+    )
+
+    seen = {"q_proj_out": None}
+
+    def hook(_module, _inp, out):
+        seen["q_proj_out"] = out.dtype
+
+    handle = model.blocks[0].q_proj.register_forward_hook(hook)
+    try:
+        prompt = torch.tensor([[72, 101, 108, 108, 111]], device=DEVICE)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            out = model.generate(prompt, max_new_tokens=32, temperature=0.8, top_k=8, ascii_guard=True)
+    finally:
+        handle.remove()
+
+    generated = out[0, 5:].cpu().tolist()
+    valid_ascii = {0, 9, 10, 13} | set(range(32, 127))
+    invalid = [t for t in generated if t not in valid_ascii]
+
+    check("mixed generation keeps bf16 visible activations", seen["q_proj_out"] == torch.bfloat16, f"dtype={seen['q_proj_out']}")
+    check("mixed generation returns token ids", out.dtype == torch.long, f"dtype={out.dtype}")
+    check(f"mixed generation keeps ascii_guard valid ({len(invalid)} invalid)",
+          len(invalid) == 0,
+          f"invalid tokens: {invalid[:10]}")
+
+
+#====================
+# 17. Mixed guardrails: invalid high-level mixed usage must fail loudly
+#====================
+
+def test_mixed_precision_guardrails():
+    """mixed mode should reject half-cast master weights and missing bf16 support"""
+    print("\n=== test_mixed_precision_guardrails ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed guardrails skipped", "bf16 not supported on this GPU")
+        return
+
+    inp = torch.randn(4, 16, device=DEVICE)
+    layer = pyqitnn.QITNNLinear(16, 8, mixed_precision=True, device=DEVICE).half()
+    layer_msg = capture_runtime_error(lambda: layer(inp))
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE, mixed_precision=True,
+    ).half()
+    tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+    model_msg = capture_runtime_error(lambda: model(tokens))
+
+    with patch("torch.cuda.is_bf16_supported", return_value=False):
+        train_msg = capture_runtime_error(
+            lambda: train(
+                dataset="ignored_under_bf16_guard.txt",
+                steps=1,
+                mixed_precision=True,
+                no_save=True,
+                no_interactive=True,
+            )
+        )
+
+    check("mixed linear rejects half-cast QITNN master weights",
+          "fp32 master weights" in layer_msg and ".half()" in layer_msg,
+          layer_msg or "no RuntimeError")
+    check("mixed model rejects half-cast master weights",
+          "fp32 master weights" in model_msg and ".half()" in model_msg,
+          model_msg or "no RuntimeError")
+    check("train() mixed path rejects missing bf16 support",
+          "requires CUDA bf16 support" in train_msg,
+          train_msg or "no RuntimeError")
+
+
+#====================
+# 18. Mixed precision off: explicit fp32 path must stay trusted even under outer autocast
+#====================
+
+def test_mixed_precision_default_stays_fp32():
+    """mixed_precision=False must force the trusted fp32 path even under outer autocast"""
+    print("\n=== test_mixed_precision_default_stays_fp32 ===")
+    torch.manual_seed(42)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE, mixed_precision=False,
+    )
+
+    seen = {"q_proj_out": None}
+
+    def hook(_mod, _inp, out):
+        seen["q_proj_out"] = out.dtype
+
+    handle = model.blocks[0].q_proj.register_forward_hook(hook)
+
+    tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, loss = model(tokens, targets=tokens)
+
+    handle.remove()
+
+    check("mixed_precision=False keeps q_proj output in fp32", seen["q_proj_out"] == torch.float32, f"dtype={seen['q_proj_out']}")
+    check("mixed_precision=False keeps logits in fp32", logits.dtype == torch.float32, f"dtype={logits.dtype}")
+    check("mixed_precision=False keeps loss in fp32", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+
+
+#====================
+# 19. Mixed precision on: bf16 activations with fp32 master weights must work
+#====================
+
+def test_qitnn_linear_mixed_precision_smoke():
+    """QITNNLinear mixed_precision path should emit bf16 activations but keep fp32 master weights"""
+    print("\n=== test_qitnn_linear_mixed_precision_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed precision linear skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(42)
+    layer = pyqitnn.QITNNLinear(16, 8, mixed_precision=True, device=DEVICE)
+    inp = torch.randn(4, 16, device=DEVICE)
+
+    out = layer(inp)
+    loss = out.float().square().mean()
+    loss.backward()
+
+    check("QITNNLinear mixed output is bf16", out.dtype == torch.bfloat16, f"dtype={out.dtype}")
+    check("QITNNLinear master weights stay fp32", layer.a_neg.dtype == torch.float32 and layer.a_zero.dtype == torch.float32 and layer.a_pos.dtype == torch.float32)
+    check("QITNNLinear mixed gradients are finite", torch.isfinite(layer.a_neg.grad).all().item() and torch.isfinite(layer.a_zero.grad).all().item() and torch.isfinite(layer.a_pos.grad).all().item())
+
+
+def test_qitnn_linear_mixed_precision_forces_bf16():
+    """high-level mixed_precision should stay on the conservative bf16 path even under outer fp16 autocast"""
+    print("\n=== test_qitnn_linear_mixed_precision_forces_bf16 ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed precision linear force-bf16 skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(42)
+    layer = pyqitnn.QITNNLinear(16, 8, mixed_precision=True, device=DEVICE)
+    inp = torch.randn(4, 16, device=DEVICE)
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        out = layer(inp)
+        loss = out.float().square().mean()
+    loss.backward()
+
+    check("QITNNLinear mixed path ignores outer fp16 autocast for visible dtype", out.dtype == torch.bfloat16, f"dtype={out.dtype}")
+    check("QITNNLinear mixed path keeps fp32 master-weight grads under outer fp16 autocast", layer.a_neg.grad is not None and layer.a_neg.grad.dtype == torch.float32)
+
+
+def test_model_mixed_precision_smoke():
+    """full model mixed_precision path should run with bf16 visible activations and fp32 loss"""
+    print("\n=== test_model_mixed_precision_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed precision model skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(42)
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE, mixed_precision=True,
+    )
+
+    seen = {"q_proj_out": None}
+
+    def hook(_mod, _inp, out):
+        seen["q_proj_out"] = out.dtype
+
+    handle = model.blocks[0].q_proj.register_forward_hook(hook)
+
+    tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+    logits, loss = model(tokens, targets=tokens)
+    loss.backward()
+    model.apply_qitnn_prior(step_qk=5e-5, step_vo=5e-5, step_ff=5e-5, entropy_floor=1.0840643)
+
+    handle.remove()
+
+    check("mixed_precision=True uses bf16 QTS activations", seen["q_proj_out"] == torch.bfloat16, f"dtype={seen['q_proj_out']}")
+    check("mixed_precision=True emits bf16 logits", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
+    check("mixed_precision=True keeps fp32 loss", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+    check("mixed_precision=True keeps fp32 QTS weights", model.blocks[0].q_proj.a_neg.dtype == torch.float32)
+    check("mixed_precision=True backward is finite", torch.isfinite(model.blocks[0].q_proj.a_neg.grad).all().item() and torch.isfinite(model.head.weight.grad).all().item())
+
+
+#====================
+# 18. CLI precision toggle: defaults and explicit overrides must be stable
+#====================
+
+def test_mixed_precision_cli_defaults():
+    """CLI parsing must resolve the new precision_mode contract and keep legacy flags compatible"""
+    print("\n=== test_mixed_precision_cli_defaults ===")
+
+    train_default = _resolve_precision_mode_cfg(TrainConfig())
+    default_cfg = _parse_cli([])
+    legacy_on_cfg = _parse_cli(["--mixed-precision"])
+    legacy_off_cfg = _parse_cli(["--mixed-precision", "--no-mixed-precision"])
+    mode_cfg = _parse_cli(["--precision-mode", "qts_fp32_rest_bf16"])
+    alias_cfg = _parse_cli(["--precision-mode", "mixed_bf16_native"])
+    conflict_msg = capture_runtime_error(
+        lambda: _resolve_precision_mode_cfg(_parse_cli(["--mixed-precision", "--precision-mode", "fp32"]))
+    )
+
+    check("TrainConfig default resolves cleanly", train_default in {("fp32", False), ("qts_fp32_rest_bf16", True)}, f"default={train_default}")
+    check("CLI default preserves TrainConfig default", _resolve_precision_mode_cfg(default_cfg) == train_default, f"resolved={_resolve_precision_mode_cfg(default_cfg)}")
+    check("CLI legacy --mixed-precision maps to qts_fp32_rest_bf16", _resolve_precision_mode_cfg(legacy_on_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(legacy_on_cfg)}")
+    check("CLI legacy --no-mixed-precision resolves to fp32", _resolve_precision_mode_cfg(legacy_off_cfg) == ("fp32", False), f"resolved={_resolve_precision_mode_cfg(legacy_off_cfg)}")
+    check("CLI --precision-mode qts_fp32_rest_bf16 enables mixed path", _resolve_precision_mode_cfg(mode_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(mode_cfg)}")
+    check("CLI precision_mode alias normalizes to qts_fp32_rest_bf16", _resolve_precision_mode_cfg(alias_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(alias_cfg)}")
+    check("CLI conflicting legacy flag and precision_mode is rejected", "conflict" in conflict_msg, conflict_msg or "no RuntimeError")
+
+
+#====================
+# 19. High-level precision_mode: layer/model constructors must accept the new mode contract
+#====================
+
+def test_precision_mode_high_level_api():
+    """high-level pyqitnn constructors should accept precision_mode directly"""
+    print("\n=== test_precision_mode_high_level_api ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("precision_mode high-level skipped", "bf16 not supported on this GPU")
+        return
+
+    inp = torch.randn(4, 16, device=DEVICE)
+    layer = pyqitnn.QITNNLinear(16, 8, precision_mode="qts_fp32_rest_bf16", device=DEVICE)
+    out = layer(inp)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE, precision_mode="mixed_bf16_native",
+    )
+    seen = {"q_proj_out": None}
+
+    def hook(_module, _inp, out):
+        seen["q_proj_out"] = out.dtype
+
+    handle = model.blocks[0].q_proj.register_forward_hook(hook)
+    try:
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        logits, loss = model(tokens, targets=tokens)
+    finally:
+        handle.remove()
+
+    conflict_msg = capture_runtime_error(
+        lambda: pyqitnn.QITNNLinear(16, 8, precision_mode="fp32", mixed_precision=True, device=DEVICE)
+    )
+
+    check("precision_mode layer emits bf16 visible output", out.dtype == torch.bfloat16, f"dtype={out.dtype}")
+    check("precision_mode model normalizes alias to qts_fp32_rest_bf16", model.precision_mode == "qts_fp32_rest_bf16", f"mode={model.precision_mode}")
+    check("precision_mode model drives bf16 q_proj activations", seen["q_proj_out"] == torch.bfloat16, f"dtype={seen['q_proj_out']}")
+    check("precision_mode model emits bf16 logits", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
+    check("precision_mode model keeps fp32 loss", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+    check("precision_mode conflict with legacy bool is rejected", "conflict" in conflict_msg, conflict_msg or "no RuntimeError")
+
+
+#====================
+# 20. Low-level precision_mode: public ops should accept the new mode contract too
+#====================
+
+def test_precision_mode_low_level_api():
+    """low-level public ops should accept precision_mode while keeping legacy mixed_precision compatible"""
+    print("\n=== test_precision_mode_low_level_api ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("precision_mode low-level skipped", "bf16 not supported on this GPU")
+        return
+
+    inp = torch.randn(4, 16, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    a_n = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    a_z = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    a_p = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+
+    u, v, cn, cz, cp = forward3(inp, a_n, a_z, a_p, precision_mode="qts_fp32_rest_bf16")
+    x, y = centered_simplex(u, v, precision_mode="mixed_bf16_native")
+
+    q = torch.randn(12, 16, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(12, 16, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    val = torch.randn(12, 16, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    attn = attention2(q, k, val, precision_mode="qts_fp32_rest_bf16")
+
+    total = x.float().sum() + y.float().sum() + attn.float().sum()
+    total.backward()
+
+    pn = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    pz = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    pp = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    prior_(pn, pz, pp, step=1e-4, entropy_floor=1.0840643, precision_mode="qts_fp32_rest_bf16")
+
+    conflict_msg = capture_runtime_error(
+        lambda: forward3(inp.detach(), a_n.detach(), a_z.detach(), a_p.detach(), mixed_precision=False, precision_mode="qts_fp32_rest_bf16")
+    )
+
+    check("precision_mode forward3 bf16 outputs stay bf16", u.dtype == torch.bfloat16 and v.dtype == torch.bfloat16)
+    check("precision_mode forward3 raw channels stay fp32", cn.dtype == torch.float32 and cz.dtype == torch.float32 and cp.dtype == torch.float32)
+    check("precision_mode centered_simplex bf16 outputs stay bf16", x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16)
+    check("precision_mode attention2 bf16 output stays bf16", attn.dtype == torch.bfloat16, f"dtype={attn.dtype}")
+    check("precision_mode backward reaches bf16 activations", inp.grad is not None and inp.grad.dtype == torch.bfloat16, f"dtype={None if inp.grad is None else inp.grad.dtype}")
+    check("precision_mode backward keeps fp32 master-weight grads", a_n.grad is not None and a_n.grad.dtype == torch.float32, f"dtype={None if a_n.grad is None else a_n.grad.dtype}")
+    check("precision_mode attention grads stay bf16", q.grad is not None and q.grad.dtype == torch.bfloat16, f"dtype={None if q.grad is None else q.grad.dtype}")
+    check("precision_mode prior_ accepts bf16 tensors", pn.dtype == torch.bfloat16 and pz.dtype == torch.bfloat16 and pp.dtype == torch.bfloat16 and torch.isfinite(pn).all().item())
+    check("precision_mode conflict with legacy bool is rejected", "conflict" in conflict_msg, conflict_msg or "no RuntimeError")
+
+
+#====================
+# 21. Native mixed bridge: extension must accept bf16 tensors directly
+#====================
+
+def test_native_mixed_bridge_smoke():
+    """the native extension should accept bf16 activations without Python-side fp32 staging"""
+    print("\n=== test_native_mixed_bridge_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("native mixed bridge skipped", "bf16 not supported on this GPU")
+        return
+
+    ext = load_native()
+    torch.manual_seed(42)
+
+    inp = torch.randn(4, 16, device=DEVICE, dtype=torch.bfloat16)
+    a_n = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+    a_z = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+    a_p = torch.randn(16, 8, device=DEVICE, dtype=torch.float32)
+    u, v, cn, cz, cp = ext.forward3_cuda(inp, a_n, a_z, a_p)
+
+    check("native forward3 accepts bf16 input", u.dtype == torch.bfloat16 and v.dtype == torch.bfloat16)
+    check("native forward3 keeps cn/cz/cp in fp32", cn.dtype == torch.float32 and cz.dtype == torch.float32 and cp.dtype == torch.float32)
+
+    x, y = ext.centered_simplex_cuda(u, v)
+    check("native centered_simplex preserves bf16", x.dtype == torch.bfloat16 and y.dtype == torch.bfloat16)
+
+    ox, oy = ext.attention2_cuda(x, y, x, y, x, y)
+    check("native attention2 preserves bf16", ox.dtype == torch.bfloat16 and oy.dtype == torch.bfloat16)
+
+    dox = torch.randn_like(ox)
+    doy = torch.randn_like(oy)
+    dqx, dqy, dkx, dky, dvx, dvy = ext.attention_backward2_cuda(dox, doy, x, y, x, y, x, y)
+    check(
+        "native attention backward preserves bf16",
+        all(t.dtype == torch.bfloat16 for t in (dqx, dqy, dkx, dky, dvx, dvy))
+    )
+
+    pn = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    pz = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    pp = torch.randn(8, 8, device=DEVICE, dtype=torch.bfloat16)
+    ext.prior_cuda(pn, pz, pp, 1e-4, 1.0840643)
+    check(
+        "native prior accepts bf16 tensors",
+        pn.dtype == torch.bfloat16 and pz.dtype == torch.bfloat16 and pp.dtype == torch.bfloat16 and
+        torch.isfinite(pn.float()).all().item() and torch.isfinite(pz.float()).all().item() and torch.isfinite(pp.float()).all().item()
+    )
+
+
+#====================
+# 22. Public mixed path: fp16 should work through the Python API too
+#====================
+
+def test_public_fp16_mixed_api_smoke():
+    """public mixed API should accept fp16 tensors without falling back to Python-side fp32 staging"""
+    print("\n=== test_public_fp16_mixed_api_smoke ===")
+    torch.manual_seed(42)
+
+    inp = torch.randn(4, 16, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    a_n = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    a_z = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+    a_p = torch.randn(16, 8, device=DEVICE, dtype=torch.float32, requires_grad=True)
+
+    u, v, cn, cz, cp = forward3(inp, a_n, a_z, a_p, mixed_precision=True)
+    x, y = centered_simplex(u, v, mixed_precision=True)
+
+    q = torch.randn(12, 16, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    k = torch.randn(12, 16, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    val = torch.randn(12, 16, device=DEVICE, dtype=torch.float16, requires_grad=True)
+    attn = attention2(q, k, val, mixed_precision=True)
+
+    loss = (
+        x.float().square().mean()
+        + y.float().square().mean()
+        + attn.float().square().mean()
+    )
+    loss.backward()
+
+    check("public forward3 fp16 outputs stay fp16", u.dtype == torch.float16 and v.dtype == torch.float16)
+    check("public forward3 raw channels stay fp32", cn.dtype == torch.float32 and cz.dtype == torch.float32 and cp.dtype == torch.float32)
+    check("public centered_simplex fp16 outputs stay fp16", x.dtype == torch.float16 and y.dtype == torch.float16)
+    check("public attention2 fp16 output stays fp16", attn.dtype == torch.float16, f"dtype={attn.dtype}")
+    check("public fp16 backward reaches activations", inp.grad is not None and inp.grad.dtype == torch.float16, f"dtype={None if inp.grad is None else inp.grad.dtype}")
+    check(
+        "public fp16 backward keeps fp32 master-weight grads",
+        a_n.grad is not None and a_z.grad is not None and a_p.grad is not None and
+        a_n.grad.dtype == torch.float32 and a_z.grad.dtype == torch.float32 and a_p.grad.dtype == torch.float32
+    )
+    check(
+        "public fp16 attention grads stay fp16",
+        q.grad is not None and k.grad is not None and val.grad is not None and
+        q.grad.dtype == torch.float16 and k.grad.dtype == torch.float16 and val.grad.dtype == torch.float16
+    )
+
+    pn = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+    pz = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+    pp = torch.randn(8, 8, device=DEVICE, dtype=torch.float16)
+    prior_(pn, pz, pp, step=1e-4, entropy_floor=1.0840643, mixed_precision=True)
+    check(
+        "public prior_ accepts fp16 tensors",
+        pn.dtype == torch.float16 and pz.dtype == torch.float16 and pp.dtype == torch.float16 and
+        torch.isfinite(pn.float()).all().item() and torch.isfinite(pz.float()).all().item() and torch.isfinite(pp.float()).all().item()
+    )
+
+
+#====================
+# 23. Mixed train parity: adversarial short-run against fp32
+#====================
+
+def test_mixed_precision_training_parity_stress():
+    """mixed training should stay finite and reasonably close to fp32 under alternating outer autocast"""
+    print("\n=== test_mixed_precision_training_parity_stress ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed parity stress skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(123)
+    model_fp32 = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24, ffn_dim=48, seq_len=24, layers=2, device=DEVICE, mixed_precision=False,
+    )
+    model_mixed = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24, ffn_dim=48, seq_len=24, layers=2, device=DEVICE, mixed_precision=True,
+    )
+    model_mixed.load_state_dict(model_fp32.state_dict())
+
+    opt_fp32 = torch.optim.AdamW(model_fp32.parameters(), lr=3e-4)
+    opt_mixed = torch.optim.AdamW(model_mixed.parameters(), lr=3e-4)
+    batch_gen = torch.Generator(device="cpu")
+    batch_gen.manual_seed(321)
+
+    loss_drifts: list[float] = []
+    dtype_ok = True
+    finite_ok = True
+    steps = 12
+
+    for step in range(steps):
+        tokens = torch.randint(0, 256, (2, 24), generator=batch_gen, dtype=torch.long).to(DEVICE)
+        targets = torch.randint(0, 256, (2, 24), generator=batch_gen, dtype=torch.long).to(DEVICE)
+
+        opt_fp32.zero_grad(set_to_none=True)
+        _, loss_fp32 = model_fp32(tokens, targets=targets)
+        loss_fp32.backward()
+        opt_fp32.step()
+        model_fp32.apply_qitnn_prior(step_qk=5e-5, step_vo=5e-5, step_ff=5e-5, entropy_floor=1.0840643)
+
+        mode = step % 3
+        if mode == 0:
+            outer_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
+        elif mode == 1:
+            outer_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+        else:
+            outer_ctx = nullcontext()
+
+        opt_mixed.zero_grad(set_to_none=True)
+        with outer_ctx:
+            logits_mixed, loss_mixed = model_mixed(tokens, targets=targets)
+        loss_mixed.backward()
+        opt_mixed.step()
+        model_mixed.apply_qitnn_prior(step_qk=5e-5, step_vo=5e-5, step_ff=5e-5, entropy_floor=1.0840643)
+
+        lf = float(loss_fp32.detach().cpu())
+        lm = float(loss_mixed.detach().cpu())
+        loss_drifts.append(abs(lm - lf) / max(abs(lf), 1e-8))
+        dtype_ok = dtype_ok and logits_mixed.dtype == torch.bfloat16 and loss_mixed.dtype == torch.float32
+        finite_ok = finite_ok and math.isfinite(lf) and math.isfinite(lm)
+
+    probe_tokens = torch.randint(0, 256, (2, 24), generator=batch_gen, dtype=torch.long).to(DEVICE)
+    probe_targets = torch.randint(0, 256, (2, 24), generator=batch_gen, dtype=torch.long).to(DEVICE)
+
+    with torch.no_grad():
+        logits_fp32, loss_fp32 = model_fp32(probe_tokens, targets=probe_targets)
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            logits_mixed, loss_mixed = model_mixed(probe_tokens, targets=probe_targets)
+
+    logit_diff = (logits_mixed.float() - logits_fp32.float()).abs()
+    eval_loss_gap = abs(float(loss_mixed.detach().cpu()) - float(loss_fp32.detach().cpu()))
+
+    stats_fp32 = pyqitnn.qitnn_diag_stats(
+        model_fp32.blocks[0].q_proj.a_neg,
+        model_fp32.blocks[0].q_proj.a_zero,
+        model_fp32.blocks[0].q_proj.a_pos,
+    )
+    stats_mixed = pyqitnn.qitnn_diag_stats(
+        model_mixed.blocks[0].q_proj.a_neg,
+        model_mixed.blocks[0].q_proj.a_zero,
+        model_mixed.blocks[0].q_proj.a_pos,
+    )
+    diag_gap = max(
+        abs(stats_fp32["p_neg"] - stats_mixed["p_neg"]),
+        abs(stats_fp32["p_zero"] - stats_mixed["p_zero"]),
+        abs(stats_fp32["p_pos"] - stats_mixed["p_pos"]),
+        abs(stats_fp32["h"] - stats_mixed["h"]),
+    )
+
+    check("mixed parity stress keeps mixed visible dtype pinned to bf16", dtype_ok)
+    check("mixed parity stress keeps both runs finite", finite_ok)
+    check(f"mixed parity stress max train loss drift={max(loss_drifts):.4f}", max(loss_drifts) < 0.03, f"drifts={loss_drifts}")
+    check(f"mixed parity stress eval loss gap={eval_loss_gap:.4f}", eval_loss_gap < 0.08, f"gap={eval_loss_gap:.4f}")
+    check(f"mixed parity stress mean logit gap={logit_diff.mean().item():.4f}", logit_diff.mean().item() < 0.20, f"mean_gap={logit_diff.mean().item():.4f}")
+    check(f"mixed parity stress max logit gap={logit_diff.max().item():.4f}", logit_diff.max().item() < 1.00, f"max_gap={logit_diff.max().item():.4f}")
+    check(f"mixed parity stress q_proj diag gap={diag_gap:.4f}", diag_gap < 0.03, f"diag_gap={diag_gap:.4f}")
+
+
+#====================
+# 24. Memory stability: repeated forward/backward does not OOM or leak
 #====================
 
 def test_memory_stability():
@@ -732,7 +1261,7 @@ def test_memory_stability():
 
 
 #====================
-# 17. Simplex gelu: only x channel is activated, y passes through
+# 19. Simplex gelu: only x channel is activated, y passes through
 #====================
 
 def test_simplex_gelu_passthrough():
@@ -767,7 +1296,7 @@ def test_simplex_gelu_passthrough():
 
 
 #====================
-# 18. Weight initialization: all triplets should start near-uniform
+# 20. Weight initialization: all triplets should start near-uniform
 #====================
 
 def test_init_near_uniform():
@@ -805,7 +1334,7 @@ def test_init_near_uniform():
 
 
 #====================
-# 19. Determinism: same seed -> exact same training trajectory
+# 25. Determinism: same seed -> exact same training trajectory
 #====================
 
 def test_determinism():
@@ -840,7 +1369,7 @@ def test_determinism():
 
 
 #====================
-# 20. Residual connection: removing residual should hurt loss
+# 26. Residual connection: removing residual should hurt loss
 #====================
 
 def test_residual_matters():
@@ -872,7 +1401,7 @@ def test_residual_matters():
 
 
 #====================
-# 21. Byte tokenizer: current byte path must remain stable
+# 27. Byte tokenizer: current byte path must remain stable
 #====================
 
 def test_byte_tokenizer_roundtrip():
@@ -887,7 +1416,7 @@ def test_byte_tokenizer_roundtrip():
 
 
 #====================
-# 22. BPE tokenizer: roundtrip and vocab smoke
+# 28. BPE tokenizer: roundtrip and vocab smoke
 #====================
 
 def test_bpe_tokenizer_roundtrip():
@@ -915,7 +1444,7 @@ def test_bpe_tokenizer_roundtrip():
 
 
 #====================
-# 23. BPE trainer smoke: end-to-end trainer path without touching QTS math
+# 29. BPE trainer smoke: end-to-end trainer path without touching QTS math
 #====================
 
 def test_bpe_trainer_smoke():
@@ -957,7 +1486,214 @@ def test_bpe_trainer_smoke():
 
 
 #====================
-# 24. JSON loader: extract training text from JSON payloads
+# 30. Mixed trainer smoke: full train() path must preserve the conservative bf16 contract
+#====================
+
+def test_mixed_precision_trainer_smoke():
+    print("\n=== test_mixed_precision_trainer_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed precision trainer skipped", "bf16 not supported on this GPU")
+        return
+
+    tmp_path = ROOT / "_tmp_mixed_dataset.txt"
+    text = (
+        "hello simplex transformer born rule attention qitnn stream\n"
+        "mixed precision trainer smoke keeps qts master weights in fp32\n"
+    ) * 64
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            steps=2,
+            mixed_precision=True,
+            no_save=True,
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=16,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    model = result["model"]
+    last_loss = result.get("last_loss")
+    tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+    targets = torch.randint(0, 256, (2, 16), device=DEVICE)
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            logits, loss = model(tokens, targets=targets)
+
+    check("mixed trainer produced finite loss", last_loss is not None and math.isfinite(last_loss), f"last_loss={last_loss}")
+    check("mixed trainer returns mixed model", model.mixed_precision is True)
+    check("mixed trainer preserves fp32 QTS master weights", model.blocks[0].q_proj.a_neg.dtype == torch.float32)
+    check("mixed trainer preserves fp32 head weights", model.head.weight.dtype == torch.float32)
+    check("mixed trainer keeps bf16 visible logits after training", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
+    check("mixed trainer keeps fp32 loss after training", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+
+
+#====================
+# 31. Mixed checkpoint resume: saved mixed runs must reload and continue cleanly
+#====================
+
+def test_mixed_precision_checkpoint_resume_smoke():
+    print("\n=== test_mixed_precision_checkpoint_resume_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed checkpoint resume skipped", "bf16 not supported on this GPU")
+        return
+
+    tmp_path = ROOT / "_tmp_mixed_resume_dataset.txt"
+    save_dir = ROOT / "_tmp_mixed_resume_runs"
+    run_name_a = "mixed_resume_a"
+    run_name_b = "mixed_resume_b"
+    text = (
+        "hello simplex transformer born rule attention qitnn stream\n"
+        "mixed checkpoint resume smoke keeps precision contract intact\n"
+    ) * 64
+
+    cleanup_tree(save_dir)
+    saved_ckpt = False
+    saved_tok = False
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        base = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            steps=2,
+            mixed_precision=True,
+            save_dir=str(save_dir),
+            run_name=run_name_a,
+            save_every=1,
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=16,
+        )
+
+        base_run_dir = Path(base["run_dir"])
+        ckpt_path = base_run_dir / "ckpt_final.pt"
+        saved_ckpt = ckpt_path.exists()
+        saved_tok = (base_run_dir / "tokenizer.json").exists()
+        base_ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+        resumed = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            epochs=2,
+            steps_per_epoch=1,
+            mixed_precision=True,
+            save_dir=str(save_dir),
+            run_name=run_name_b,
+            save_every=1,
+            resume=str(ckpt_path),
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=16,
+        )
+
+        resumed_run_dir = Path(resumed["run_dir"])
+        resumed_ckpt_path = resumed_run_dir / "ckpt_final.pt"
+        resumed_ckpt = torch.load(str(resumed_ckpt_path), map_location="cpu", weights_only=False)
+        model = resumed["model"]
+
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+        targets = torch.randint(0, 256, (2, 16), device=DEVICE)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                logits, loss = model(tokens, targets=targets)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_dir)
+
+    check("mixed checkpoint run saved final checkpoint", saved_ckpt, str(ckpt_path))
+    check("mixed checkpoint run saved tokenizer asset", saved_tok, str(base_run_dir / "tokenizer.json"))
+    check("mixed resume advanced global_step", resumed_ckpt.get("global_step") == base_ckpt.get("global_step", 0) + 1, f"base={base_ckpt.get('global_step')} resumed={resumed_ckpt.get('global_step')}")
+    check("mixed resume advanced epoch", resumed_ckpt.get("epoch") == 2, f"epoch={resumed_ckpt.get('epoch')}")
+    check("mixed resumed model keeps fp32 QTS master weights", model.blocks[0].q_proj.a_neg.dtype == torch.float32)
+    check("mixed resumed model keeps bf16 visible logits", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
+    check("mixed resumed model keeps fp32 loss", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+
+
+#====================
+# 32. Real CLI mixed smoke: entrypoint path must work in mixed mode
+#====================
+
+def test_mixed_precision_cli_smoke():
+    print("\n=== test_mixed_precision_cli_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed cli smoke skipped", "bf16 not supported on this GPU")
+        return
+
+    tmp_path = ROOT / "_tmp_mixed_cli_dataset.txt"
+    text = (
+        "hello simplex transformer born rule attention qitnn stream\n"
+        "mixed cli smoke keeps the entrypoint contract honest\n"
+    ) * 64
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "BasicQITNN_Transformer.py",
+                "--dataset", str(tmp_path),
+                "--tokenizer", "byte",
+                "--dim", "16",
+                "--ffn", "32",
+                "--layers", "1",
+                "--seq-len", "16",
+                "--batch-size", "1",
+                "--steps", "2",
+                "--mixed-precision",
+                "--no-save",
+                "--no-interactive",
+                "--log-every", "1",
+                "--prompt", "hello simplex",
+                "--prompt-bytes", "16",
+                "--gen-bytes", "16",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    detail = stdout[-400:] if proc.returncode == 0 else (stderr or stdout)[-800:]
+
+    check("mixed CLI process exits cleanly", proc.returncode == 0, detail)
+    check("mixed CLI reports mixed mode enabled", "mixed_prec    True" in stdout, detail)
+    check("mixed CLI reports precision_mode qts_fp32_rest_bf16", "precision_mode qts_fp32_rest_bf16" in stdout, detail)
+    check("mixed CLI reaches generation output", "generated_text_begin" in stdout and "generated_text_end" in stdout, detail)
+
+
+#====================
+# 33. JSON loader: extract training text from JSON payloads
 #====================
 
 def test_json_loader_extracts_text():
@@ -981,7 +1717,7 @@ def test_json_loader_extracts_text():
 
 
 #====================
-# 25. JSON trainer smoke: train on JSONL without changing QTS math
+# 34. JSON trainer smoke: train on JSONL without changing QTS math
 #====================
 
 def test_json_trainer_smoke():
@@ -1044,6 +1780,18 @@ if __name__ == "__main__":
     test_qitnn_linear_simplex_consistency()
     test_adamw_param_groups()
     test_generation_sanity()
+    test_mixed_precision_generation_sanity()
+    test_mixed_precision_guardrails()
+    test_mixed_precision_default_stays_fp32()
+    test_qitnn_linear_mixed_precision_smoke()
+    test_qitnn_linear_mixed_precision_forces_bf16()
+    test_model_mixed_precision_smoke()
+    test_mixed_precision_cli_defaults()
+    test_precision_mode_high_level_api()
+    test_precision_mode_low_level_api()
+    test_native_mixed_bridge_smoke()
+    test_public_fp16_mixed_api_smoke()
+    test_mixed_precision_training_parity_stress()
     test_memory_stability()
     test_simplex_gelu_passthrough()
     test_init_near_uniform()
@@ -1052,6 +1800,9 @@ if __name__ == "__main__":
     test_byte_tokenizer_roundtrip()
     test_bpe_tokenizer_roundtrip()
     test_bpe_trainer_smoke()
+    test_mixed_precision_trainer_smoke()
+    test_mixed_precision_checkpoint_resume_smoke()
+    test_mixed_precision_cli_smoke()
     test_json_loader_extracts_text()
     test_json_trainer_smoke()
 
