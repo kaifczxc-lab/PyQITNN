@@ -1,11 +1,12 @@
 """
 Stress test for PyQITNN architecture.
 Designed to expose hidden bugs before public release.
-
+Important: This stress_test created by using AI
 Run: python stress_test.py
 Requires CUDA GPU.
 """
 from contextlib import nullcontext
+import csv
 import json
 import shutil
 import subprocess
@@ -22,7 +23,20 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import pyqitnn
-from BasicQITNN_Transformer import TrainConfig, _parse_cli, _resolve_precision_mode_cfg, load_bytes, train
+from BasicQITNN_Transformer import (
+    TrainConfig,
+    _build_token_byte_lut,
+    _count_token_bytes,
+    _parse_cli,
+    _resolve_precision_mode_cfg,
+    eval_split_metrics,
+    load_bytes,
+    loss_to_bpb,
+    loss_to_perplexity,
+    run_val,
+    total_nll_to_bpb,
+    train,
+)
 from pyqitnn.ops import forward3, prior_, centered_simplex, attention2
 from pyqitnn.bridge import load_native
 
@@ -1482,7 +1496,11 @@ def test_bpe_trainer_smoke():
 
     tmp_path.unlink(missing_ok=True)
     last_loss = result.get("last_loss")
+    train_bpb = result.get("last_epoch_train_bpb")
+    val_bpb = result.get("last_epoch_val_bpb")
     check("bpe trainer produced finite loss", last_loss is not None and math.isfinite(last_loss), f"last_loss={last_loss}")
+    check("bpe trainer returned finite train BPB", train_bpb is not None and math.isfinite(train_bpb), f"train_bpb={train_bpb}")
+    check("bpe trainer returned finite val BPB", val_bpb is not None and math.isfinite(val_bpb), f"val_bpb={val_bpb}")
 
 
 #====================
@@ -1525,6 +1543,12 @@ def test_mixed_precision_trainer_smoke():
 
     model = result["model"]
     last_loss = result.get("last_loss")
+    first_loss = result.get("first_loss")
+    first_bpb = result.get("first_bpb")
+    last_bpb = result.get("last_bpb")
+    train_bpb = result.get("last_epoch_train_bpb")
+    val_loss = result.get("last_epoch_val_loss")
+    val_bpb = result.get("last_epoch_val_bpb")
     tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
     targets = torch.randint(0, 256, (2, 16), device=DEVICE)
     with torch.no_grad():
@@ -1537,6 +1561,10 @@ def test_mixed_precision_trainer_smoke():
     check("mixed trainer preserves fp32 head weights", model.head.weight.dtype == torch.float32)
     check("mixed trainer keeps bf16 visible logits after training", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
     check("mixed trainer keeps fp32 loss after training", loss.dtype == torch.float32, f"dtype={loss.dtype}")
+    check("mixed trainer first BPB tracks byte loss", first_bpb is not None and first_loss is not None and abs(first_bpb - (first_loss / math.log(2.0))) < 1e-6, f"first_bpb={first_bpb} first_loss={first_loss}")
+    check("mixed trainer last BPB tracks byte loss", last_bpb is not None and last_loss is not None and abs(last_bpb - (last_loss / math.log(2.0))) < 1e-6, f"last_bpb={last_bpb} last_loss={last_loss}")
+    check("mixed trainer epoch train BPB tracks byte loss", train_bpb is not None and abs(train_bpb - (result['last_epoch_train_loss'] / math.log(2.0))) < 1e-6, f"train_bpb={train_bpb} train_loss={result['last_epoch_train_loss']}")
+    check("mixed trainer epoch val BPB tracks byte loss", val_bpb is not None and val_loss is not None and abs(val_bpb - (val_loss / math.log(2.0))) < 1e-6, f"val_bpb={val_bpb} val_loss={val_loss}")
 
 
 #====================
@@ -1561,6 +1589,8 @@ def test_mixed_precision_checkpoint_resume_smoke():
     cleanup_tree(save_dir)
     saved_ckpt = False
     saved_tok = False
+    csv_ok = False
+    csv_detail = ""
     try:
         tmp_path.write_text(text, encoding="utf-8")
         base = train(
@@ -1588,6 +1618,23 @@ def test_mixed_precision_checkpoint_resume_smoke():
         saved_ckpt = ckpt_path.exists()
         saved_tok = (base_run_dir / "tokenizer.json").exists()
         base_ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+        metrics_path = base_run_dir / "metrics.csv"
+        if metrics_path.exists():
+            with open(metrics_path, "r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            if rows:
+                row0 = rows[0]
+                csv_ok = (
+                    "train_bpb" in row0 and
+                    "val_bpb" in row0 and
+                    row0["train_bpb"] not in {"", "n/a"} and
+                    row0["val_bpb"] not in {"", "n/a"}
+                )
+                csv_detail = str(row0)
+            else:
+                csv_detail = "metrics.csv has no data rows"
+        else:
+            csv_detail = str(metrics_path)
 
         resumed = train(
             dataset=str(tmp_path),
@@ -1627,8 +1674,17 @@ def test_mixed_precision_checkpoint_resume_smoke():
 
     check("mixed checkpoint run saved final checkpoint", saved_ckpt, str(ckpt_path))
     check("mixed checkpoint run saved tokenizer asset", saved_tok, str(base_run_dir / "tokenizer.json"))
+    check("mixed checkpoint metrics.csv carries BPB columns", csv_ok, csv_detail)
     check("mixed resume advanced global_step", resumed_ckpt.get("global_step") == base_ckpt.get("global_step", 0) + 1, f"base={base_ckpt.get('global_step')} resumed={resumed_ckpt.get('global_step')}")
     check("mixed resume advanced epoch", resumed_ckpt.get("epoch") == 2, f"epoch={resumed_ckpt.get('epoch')}")
+    returned_final_diff = 0.0
+    for key, tensor in model.state_dict().items():
+        ckpt_tensor = resumed_ckpt["model"][key]
+        if torch.is_tensor(tensor):
+            diff = (tensor.detach().cpu().float() - ckpt_tensor.detach().cpu().float()).abs().max().item()
+            if diff > returned_final_diff:
+                returned_final_diff = diff
+    check("mixed resumed model still matches final checkpoint after eval", returned_final_diff < 1e-7, f"max_diff={returned_final_diff}")
     check("mixed resumed model keeps fp32 QTS master weights", model.blocks[0].q_proj.a_neg.dtype == torch.float32)
     check("mixed resumed model keeps bf16 visible logits", logits.dtype == torch.bfloat16, f"dtype={logits.dtype}")
     check("mixed resumed model keeps fp32 loss", loss.dtype == torch.float32, f"dtype={loss.dtype}")
@@ -1689,6 +1745,8 @@ def test_mixed_precision_cli_smoke():
     check("mixed CLI process exits cleanly", proc.returncode == 0, detail)
     check("mixed CLI reports mixed mode enabled", "mixed_prec    True" in stdout, detail)
     check("mixed CLI reports precision_mode qts_fp32_rest_bf16", "precision_mode qts_fp32_rest_bf16" in stdout, detail)
+    check("mixed CLI reports train BPB", "train_bpb=" in stdout, detail)
+    check("mixed CLI reports val BPB", "val_bpb=" in stdout, detail)
     check("mixed CLI reaches generation output", "generated_text_begin" in stdout and "generated_text_end" in stdout, detail)
 
 
@@ -1755,6 +1813,309 @@ def test_json_trainer_smoke():
 
 
 #====================
+# 35. BPB byte math: exact helper formulas must stay stable
+#====================
+
+def test_bpb_byte_math_helpers():
+    print("\n=== test_bpb_byte_math_helpers ===")
+    tok = pyqitnn.ByteTokenizer()
+    targets = torch.tensor([[65, 66, 67, 10], [68, 69, 70, 71]], dtype=torch.long)
+    loss = math.log(2.0)
+
+    target_tokens = int(targets.numel())
+    target_bytes = _count_token_bytes(targets, tok)
+    bpb = loss_to_bpb(loss, target_tokens, target_bytes)
+    ppl = loss_to_perplexity(loss)
+
+    check("byte target byte count equals token count", target_bytes == target_tokens, f"bytes={target_bytes} tokens={target_tokens}")
+    check("byte BPB from ln(2) loss equals 1.0", bpb is not None and abs(bpb - 1.0) < 1e-12, f"bpb={bpb}")
+    check("byte PPL from ln(2) loss equals 2.0", ppl is not None and abs(ppl - 2.0) < 1e-12, f"ppl={ppl}")
+    check("byte tokenizer keeps PPL = 2**BPB", bpb is not None and ppl is not None and abs((2.0 ** bpb) - ppl) < 1e-12, f"bpb={bpb} ppl={ppl}")
+
+
+#====================
+# 36. BPB BPE accounting: per-token byte LUT must match the effective decoded stream
+#====================
+
+def test_bpb_bpe_byte_accounting():
+    print("\n=== test_bpb_bpe_byte_accounting ===")
+    try:
+        tok = pyqitnn.train_bpe_tokenizer(
+            [
+                "hello simplex transformer\n",
+                "born rule attention stream\n",
+                "json text path keeps utf8 stable: Привет мир\n",
+            ],
+            vocab_size=320,
+            min_frequency=1,
+        )
+    except RuntimeError as e:
+        warn("bpb bpe accounting skipped", str(e))
+        return
+
+    tok_bytes_lut = _build_token_byte_lut(tok)
+    samples = [
+        "hello simplex",
+        "born rule attention stream",
+        "Привет simplex\nhello",
+    ]
+
+    for sample in samples:
+        ids = tok.encode_text(sample)
+        ids_t = torch.tensor(ids, dtype=torch.long)
+        counted_bytes = _count_token_bytes(ids_t, tok, tok_bytes_lut)
+        effective_text = tok.decode(ids, skip_special_tokens=False)
+        expected_bytes = len(effective_text.encode("utf-8", errors="replace"))
+        check(
+            f"bpe byte accounting matches effective stream [{sample[:12]!r}]",
+            counted_bytes == expected_bytes,
+            f"bytes={counted_bytes} expected={expected_bytes} ids={ids}",
+        )
+
+
+#====================
+# 37. BPB aggregation: exact corpus BPB must be computed from total bits / total bytes
+#====================
+
+def test_bpb_total_aggregation_math():
+    print("\n=== test_bpb_total_aggregation_math ===")
+    loss_a = math.log(2.0)
+    loss_b = math.log(2.0)
+
+    bpb_a = loss_to_bpb(loss_a, target_tokens=2, target_bytes=2)
+    bpb_b = loss_to_bpb(loss_b, target_tokens=4, target_bytes=8)
+    mean_window_bpb = (bpb_a + bpb_b) / 2.0
+    exact_bpb = total_nll_to_bpb(loss_a * 2 + loss_b * 4, target_bytes=10)
+
+    check("window A BPB", bpb_a is not None and abs(bpb_a - 1.0) < 1e-12, f"bpb={bpb_a}")
+    check("window B BPB", bpb_b is not None and abs(bpb_b - 0.5) < 1e-12, f"bpb={bpb_b}")
+    check("exact total BPB uses total bits / total bytes", exact_bpb is not None and abs(exact_bpb - 0.6) < 1e-12, f"bpb={exact_bpb}")
+    check("exact total BPB differs from naive window average", abs(exact_bpb - mean_window_bpb) > 1e-12, f"exact={exact_bpb} mean={mean_window_bpb}")
+
+
+#====================
+# 38. Validation BPB: run_val must aggregate total bits / total bytes
+#====================
+
+def test_run_val_bpb_aggregation():
+    print("\n=== test_run_val_bpb_aggregation ===")
+    try:
+        tok = pyqitnn.train_bpe_tokenizer(
+            [
+                "ascii stream hello world\n",
+                "utf8 stream Привет мир\n",
+            ],
+            vocab_size=320,
+            min_frequency=1,
+        )
+    except RuntimeError as e:
+        warn("run_val bpb aggregation skipped", str(e))
+        return
+
+    tok_bytes_lut = _build_token_byte_lut(tok)
+    short_ids = torch.nonzero(tok_bytes_lut == 1).reshape(-1)
+    long_ids = torch.nonzero(tok_bytes_lut >= 2).reshape(-1)
+    if short_ids.numel() < 3 or long_ids.numel() < 2:
+        warn("run_val bpb aggregation skipped", "need both short and long token pieces")
+        return
+
+    anchor = int(short_ids[0].item())
+    y0 = torch.tensor([int(short_ids[1].item()), int(short_ids[2].item())], dtype=torch.long)
+    y1 = torch.tensor([int(long_ids[0].item()), int(long_ids[1].item())], dtype=torch.long)
+    val_data = torch.tensor([anchor, int(y0[0].item()), int(y0[1].item()), int(y1[0].item()), int(y1[1].item())], dtype=torch.long)
+    loss_value = math.log(2.0)
+
+    class ScriptedLossModel(torch.nn.Module):
+        def __init__(self, losses: list[float]) -> None:
+            super().__init__()
+            self.losses = list(losses)
+            self.calls = 0
+
+        def forward(self, x, targets=None):
+            del targets
+            loss = torch.tensor(self.losses[self.calls], device=x.device, dtype=torch.float32)
+            self.calls += 1
+            return x, loss
+
+    model = ScriptedLossModel([loss_value, loss_value])
+    avg_loss, avg_bpb, n_win = run_val(
+        model,
+        val_data,
+        seq_len=2,
+        device=DEVICE,
+        max_steps=0,
+        tokenizer=tok,
+        tok_bytes_lut=tok_bytes_lut,
+    )
+
+    bytes_y0 = _count_token_bytes(y0, tok, tok_bytes_lut)
+    bytes_y1 = _count_token_bytes(y1, tok, tok_bytes_lut)
+    exact_bpb = total_nll_to_bpb(loss_value * 4, bytes_y0 + bytes_y1)
+    mean_window_bpb = (loss_to_bpb(loss_value, 2, bytes_y0) + loss_to_bpb(loss_value, 2, bytes_y1)) / 2.0
+
+    check("run_val produced two windows", n_win == 2, f"n_win={n_win}")
+    check("run_val keeps exact mean loss", abs(avg_loss - loss_value) < 1e-6, f"loss={avg_loss}")
+    check("run_val exact BPB uses total bits / total bytes", avg_bpb is not None and exact_bpb is not None and abs(avg_bpb - exact_bpb) < 1e-6, f"bpb={avg_bpb} exact={exact_bpb}")
+    check("run_val BPB is not naive mean of window BPBs", avg_bpb is not None and abs(avg_bpb - mean_window_bpb) > 1e-12, f"bpb={avg_bpb} mean={mean_window_bpb}")
+
+
+#====================
+# 39. Split-eval helper: wrapper should expose loss/BPB/PPL/windows consistently
+#====================
+
+def test_eval_split_metrics_helper():
+    print("\n=== test_eval_split_metrics_helper ===")
+    tok = pyqitnn.ByteTokenizer()
+    data = torch.tensor([65, 66, 67, 68, 69], dtype=torch.long)
+    loss_value = math.log(2.0)
+
+    class ScriptedLossModel(torch.nn.Module):
+        def __init__(self, losses: list[float]) -> None:
+            super().__init__()
+            self.losses = list(losses)
+            self.calls = 0
+
+        def forward(self, x, targets=None):
+            del targets
+            loss = torch.tensor(self.losses[self.calls], device=x.device, dtype=torch.float32)
+            self.calls += 1
+            return x, loss
+
+    model = ScriptedLossModel([loss_value, loss_value])
+    metrics = eval_split_metrics(
+        model,
+        data,
+        seq_len=2,
+        device=DEVICE,
+        max_steps=0,
+        tokenizer=tok,
+        tok_bytes_lut=None,
+    )
+
+    check("eval_split_metrics windows", metrics["windows"] == 2, f"metrics={metrics}")
+    check("eval_split_metrics loss", metrics["loss"] is not None and abs(float(metrics["loss"]) - loss_value) < 1e-6, f"metrics={metrics}")
+    check("eval_split_metrics bpb", metrics["bpb"] is not None and abs(float(metrics["bpb"]) - 1.0) < 1e-6, f"metrics={metrics}")
+    check("eval_split_metrics ppl", metrics["ppl"] is not None and abs(float(metrics["ppl"]) - 2.0) < 1e-6, f"metrics={metrics}")
+
+
+#====================
+# 40. Extended test metrics: trainer should return both best_test_* and final_test_*.
+#====================
+
+def test_extended_dataset_best_final_test_metrics_smoke():
+    print("\n=== test_extended_dataset_best_final_test_metrics_smoke ===")
+    root = ROOT / "_tmp_extended_eval"
+    train_dir = root / "train"
+    val_dir = root / "val"
+    test_dir = root / "test"
+    for p in (train_dir, val_dir, test_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    try:
+        (train_dir / "train.txt").write_text(("hello simplex train stream\n" * 96), encoding="utf-8")
+        (val_dir / "val.txt").write_text(("hello simplex val stream\n" * 64), encoding="utf-8")
+        (test_dir / "test.txt").write_text(("hello simplex test stream\n" * 64), encoding="utf-8")
+        result = train(
+            extended_dataset=True,
+            train_dir=str(train_dir),
+            val_dir=str(val_dir),
+            test_dir=str(test_dir),
+            tokenizer="byte",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            epochs=2,
+            steps_per_epoch=1,
+            no_save=True,
+            no_interactive=True,
+            log_every=1,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=16,
+        )
+    finally:
+        cleanup_tree(root)
+
+    final_test_loss = result.get("final_test_loss")
+    final_test_bpb = result.get("final_test_bpb")
+    final_test_ppl = result.get("final_test_ppl")
+    best_test_loss = result.get("best_test_loss")
+    best_test_bpb = result.get("best_test_bpb")
+    best_test_ppl = result.get("best_test_ppl")
+
+    check("extended trainer returned final_test_loss", final_test_loss is not None and math.isfinite(final_test_loss), f"final_test_loss={final_test_loss}")
+    check("extended trainer returned final_test_bpb", final_test_bpb is not None and math.isfinite(final_test_bpb), f"final_test_bpb={final_test_bpb}")
+    check("extended trainer returned final_test_ppl", final_test_ppl is not None and math.isfinite(final_test_ppl), f"final_test_ppl={final_test_ppl}")
+    check("extended trainer returned best_test_loss", best_test_loss is not None and math.isfinite(best_test_loss), f"best_test_loss={best_test_loss}")
+    check("extended trainer returned best_test_bpb", best_test_bpb is not None and math.isfinite(best_test_bpb), f"best_test_bpb={best_test_bpb}")
+    check("extended trainer returned best_test_ppl", best_test_ppl is not None and math.isfinite(best_test_ppl), f"best_test_ppl={best_test_ppl}")
+    check("legacy test_loss aliases final_test_loss", abs(result["test_loss"] - final_test_loss) < 1e-7, f"test_loss={result['test_loss']} final_test_loss={final_test_loss}")
+    check("legacy test_bpb aliases final_test_bpb", abs(result["test_bpb"] - final_test_bpb) < 1e-7, f"test_bpb={result['test_bpb']} final_test_bpb={final_test_bpb}")
+    check("legacy test_ppl aliases final_test_ppl", abs(result["test_ppl"] - final_test_ppl) < 1e-7, f"test_ppl={result['test_ppl']} final_test_ppl={final_test_ppl}")
+
+
+#====================
+# 41. Extended CLI test metrics: CLI should print both final and best test metrics.
+#====================
+
+def test_extended_dataset_cli_test_metrics_smoke():
+    print("\n=== test_extended_dataset_cli_test_metrics_smoke ===")
+    root = ROOT / "_tmp_extended_cli_eval"
+    train_dir = root / "train"
+    val_dir = root / "val"
+    test_dir = root / "test"
+    for p in (train_dir, val_dir, test_dir):
+        p.mkdir(parents=True, exist_ok=True)
+
+    try:
+        (train_dir / "train.txt").write_text(("hello simplex train stream\n" * 96), encoding="utf-8")
+        (val_dir / "val.txt").write_text(("hello simplex val stream\n" * 64), encoding="utf-8")
+        (test_dir / "test.txt").write_text(("hello simplex test stream\n" * 64), encoding="utf-8")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "BasicQITNN_Transformer.py",
+                "--extended-dataset",
+                "--train-dir", str(train_dir),
+                "--val-dir", str(val_dir),
+                "--test-dir", str(test_dir),
+                "--tokenizer", "byte",
+                "--dim", "16",
+                "--ffn", "32",
+                "--layers", "1",
+                "--seq-len", "16",
+                "--batch-size", "1",
+                "--epochs", "2",
+                "--steps-per-epoch", "1",
+                "--no-save",
+                "--no-interactive",
+                "--log-every", "1",
+                "--prompt", "hello simplex",
+                "--prompt-bytes", "16",
+                "--gen-bytes", "16",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+        )
+    finally:
+        cleanup_tree(root)
+
+    stdout = proc.stdout or ""
+    stderr = proc.stderr or ""
+    detail = stdout[-600:] if proc.returncode == 0 else (stderr or stdout)[-1000:]
+
+    check("extended CLI test-metrics process exits cleanly", proc.returncode == 0, detail)
+    check("extended CLI prints final_test_loss", "final_test_loss" in stdout and "final_test_bpb=" in stdout and "final_test_ppl=" in stdout, detail)
+    check("extended CLI prints best_test_loss", "best_test_loss" in stdout and "best_test_bpb=" in stdout and "best_test_ppl=" in stdout, detail)
+
+
+#====================
 # run all
 #====================
 
@@ -1799,12 +2160,19 @@ if __name__ == "__main__":
     test_residual_matters()
     test_byte_tokenizer_roundtrip()
     test_bpe_tokenizer_roundtrip()
+    test_bpb_byte_math_helpers()
+    test_bpb_bpe_byte_accounting()
+    test_bpb_total_aggregation_math()
+    test_run_val_bpb_aggregation()
+    test_eval_split_metrics_helper()
     test_bpe_trainer_smoke()
     test_mixed_precision_trainer_smoke()
     test_mixed_precision_checkpoint_resume_smoke()
     test_mixed_precision_cli_smoke()
     test_json_loader_extracts_text()
     test_json_trainer_smoke()
+    test_extended_dataset_best_final_test_metrics_smoke()
+    test_extended_dataset_cli_test_metrics_smoke()
 
     elapsed = time.time() - t0
 

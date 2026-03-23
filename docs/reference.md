@@ -881,19 +881,41 @@ result = train(
 
 `train()` returns a dict:
 
+`loss` values here are cross-entropy in nats per target token. `BPB` is bits per target
+byte and is the recommended metric when you want to compare byte-tokenized and
+BPE-tokenized runs on the same corpus. `PPL` is still reported, but it remains
+tokenizer-dependent. In byte mode:
+
+```text
+BPB = loss / ln(2)
+PPL = 2 ** BPB
+```
+
 | Key | Type | Description |
 |-----|------|-------------|
 | `first_loss` | float | Training loss of the very first step. |
+| `first_bpb` | float or None | Bits per byte of the very first step, computed from the target stream. |
 | `first_ppl` | float or None | Perplexity of the very first step (`exp(first_loss)`). |
 | `last_loss` | float | Training loss of the last step. |
+| `last_bpb` | float or None | Bits per byte of the last training step. |
 | `last_ppl` | float or None | Perplexity of the last step (`exp(last_loss)`). |
 | `best_val` | float or None | Best validation loss seen during training. |
+| `best_val_bpb` | float or None | BPB corresponding to `best_val`. |
 | `best_val_ppl` | float or None | Perplexity corresponding to `best_val`. |
-| `test_loss` | float or None | Test loss evaluated at the end (only if `test_dir` was provided with `extended_dataset=True`). |
-| `test_ppl` | float or None | Test perplexity evaluated at the end when test data is available. |
+| `best_test_loss` | float or None | Test loss of the best-validation checkpoint, evaluated at the end when test data is available. The returned `model` still remains the final in-memory model. |
+| `best_test_bpb` | float or None | Test BPB of the best-validation checkpoint. |
+| `best_test_ppl` | float or None | Test perplexity of the best-validation checkpoint. |
+| `final_test_loss` | float or None | Test loss of the final model state at the end of training. |
+| `final_test_bpb` | float or None | Test BPB of the final model state. |
+| `final_test_ppl` | float or None | Test perplexity of the final model state. |
+| `test_loss` | float or None | Backward-compatible alias of `final_test_loss`. |
+| `test_bpb` | float or None | Backward-compatible alias of `final_test_bpb`. |
+| `test_ppl` | float or None | Backward-compatible alias of `final_test_ppl`. |
 | `last_epoch_train_loss` | float or None | Average train loss of the final epoch. |
+| `last_epoch_train_bpb` | float or None | Average train BPB of the final epoch. |
 | `last_epoch_train_ppl` | float or None | Average train perplexity of the final epoch. |
 | `last_epoch_val_loss` | float or None | Average validation loss of the final epoch, or `None` when validation has no windows. |
+| `last_epoch_val_bpb` | float or None | Average validation BPB of the final epoch. |
 | `last_epoch_val_ppl` | float or None | Average validation perplexity of the final epoch. |
 | `last_epoch_train_tok_s` | float or None | Training throughput in tokens/sec for the final epoch. |
 | `last_epoch_val_tok_s` | float or None | Validation throughput in tokens/sec for the final epoch. |
@@ -938,7 +960,7 @@ and what happens when you change it.
 | `extended_dataset` | bool | `False` | Data loading mode switch. `False` = simple mode: load `dataset`, auto-split into train/val. `True` = extended mode: use `train_dir`/`val_dir`/`test_dir` separately, no auto-split. |
 | `train_dir` | str, Path, or None | `None` | Path to training data (extended mode only). If None in extended mode, falls back to `dataset`. |
 | `val_dir` | str, Path, or None | `None` | Path to validation data (extended mode only). If None in extended mode, validation is skipped (empty tensor). |
-| `test_dir` | str, Path, or None | `None` | Path to test data (extended mode only). If None, no test evaluation. If set, test loss is computed after training and returned in `test_loss`. |
+| `test_dir` | str, Path, or None | `None` | Path to test data (extended mode only). If None, no test evaluation. If set, the trainer evaluates both the final model state and the best-validation checkpoint on the test split, returning `final_test_*` and `best_test_*`. The legacy `test_*` keys remain as backward-compatible aliases of `final_test_*`. |
 | `max_bytes` | int | `50_000_000` | Maximum bytes to load from each data source. If a file or directory is larger, loading stops at this limit. Applies separately to train, val, and test. |
 
 **Two data modes:**
@@ -1094,9 +1116,9 @@ For long training (50+ epochs), combining both works well.
 
 | Field | Type | Default | What it does | What happens when you change it |
 |-------|------|---------|--------------|-------------------------------|
-| `log_every` | int | `100` | Print training loss every N steps. | `100` = print at steps 100, 200, etc. within each epoch. Lower = more verbose output. |
+| `log_every` | int | `100` | Print training metrics every N steps. | `100` = print at steps 100, 200, etc. within each epoch. Logs include `train_loss`, `train_bpb`, `train_ppl`, throughput, and LR. Lower = more verbose output. |
 | `diag_every` | int | `10` | Full QTS diagnostics every N epochs. | `10` = show all-layer entropy/probability stats every 10 epochs. On other epochs, only a summary subset is printed. `1` = every epoch (verbose). |
-| `csv_log` | str or None | `None` | Path to CSV log file. | `None` = auto-creates `metrics.csv` inside the run directory (if saving is enabled). Set to a custom path like `"logs/experiment.csv"` to write there. |
+| `csv_log` | str or None | `None` | Path to CSV log file. | `None` = auto-creates `metrics.csv` inside the run directory (if saving is enabled). The CSV stores `train_loss`, `train_bpb`, `train_ppl`, `val_loss`, `val_bpb`, `val_ppl`, throughput, LR, and time. Set to a custom path like `"logs/experiment.csv"` to write there. |
 
 #### Saving
 
@@ -1114,7 +1136,7 @@ For long training (50+ epochs), combining both works well.
 ```
 runs/run_20260317_143022/
   config.json        # all TrainConfig values + param count
-  metrics.csv        # epoch, train_loss, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr, time_s
+  metrics.csv        # epoch, train_loss, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr, time_s, train_bpb, val_bpb
   ckpt_best.pt       # best model by val_loss (auto-updated)
   ckpt_ep25.pt       # periodic checkpoint
   ckpt_ep50.pt

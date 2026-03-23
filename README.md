@@ -202,6 +202,15 @@ how raw text is mapped to token ids and what `vocab_size` the embedding/head use
 - `byte`: built in, fixed `vocab_size=256`, no extra dependency
 - `bpe`: optional, uses HuggingFace `tokenizers`
 
+When you compare runs across tokenizer choices, use `BPB` (bits per byte) as the
+primary metric. `PPL` is still reported, but it is tokenizer-dependent because the
+token stream changes. In byte mode the relation is exact:
+
+```text
+BPB = loss_nats / ln(2)
+PPL = 2 ** BPB
+```
+
 ```python
 import pyqitnn
 

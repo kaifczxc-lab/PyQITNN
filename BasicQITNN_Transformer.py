@@ -55,7 +55,7 @@ class TrainConfig:
     # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
     #====================
-    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
+    dataset: str | Path = r"YOUR_LINK"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
@@ -355,26 +355,41 @@ def sample_batch(data: torch.Tensor, batch: int, seq_len: int, device: torch.dev
 # validation
 #====================
 @torch.no_grad()
-def run_val(model, val_data: torch.Tensor, seq_len: int, device: torch.device, max_steps: int):
+def run_val(
+    model,
+    val_data: torch.Tensor,
+    seq_len: int,
+    device: torch.device,
+    max_steps: int,
+    *,
+    tokenizer,
+    tok_bytes_lut: torch.Tensor | None = None,
+):
     model.eval()
     n_win = max((val_data.numel() - 1) // seq_len, 0)
     if n_win < 1:
         model.train()
-        return 0.0, 0
+        return 0.0, None, 0
     if 0 < max_steps < n_win:
         n_win = max_steps
     elif max_steps == 0 and n_win > 500:
         print(f"  [warn] val has {n_win} windows, this will be slow. set val_steps=50 to cap it.")
-    total = 0.0
+    total_nll_nats = 0.0
+    total_target_tokens = 0
+    total_target_bytes = 0
     for i in range(n_win):
         s = i * seq_len
         chunk = val_data[s : s + seq_len + 1]
         xv = chunk[:-1].unsqueeze(0).to(device, non_blocking=True)
-        yv = chunk[1:].unsqueeze(0).to(device, non_blocking=True)
-        _, loss = model(xv, targets=yv)
-        total += float(loss.detach().cpu())
+        yv = chunk[1:].unsqueeze(0)
+        _, loss = model(xv, targets=yv.to(device, non_blocking=True))
+        target_tokens = int(yv.numel())
+        total_nll_nats += float(loss.detach().cpu()) * float(target_tokens)
+        total_target_tokens += target_tokens
+        total_target_bytes += _count_token_bytes(yv, tokenizer, tok_bytes_lut)
     model.train()
-    return total / n_win, n_win
+    avg_loss, avg_bpb = summarize_nll_metrics(total_nll_nats, total_target_tokens, total_target_bytes)
+    return (0.0 if avg_loss is None else avg_loss), avg_bpb, n_win
 #====================
 # text generation
 #====================
@@ -453,6 +468,175 @@ def loss_to_perplexity(loss: float | None) -> float | None:
     return math.exp(loss)
 
 
+def nats_to_bits(value: float | None) -> float | None:
+    if value is None:
+        return None
+    if math.isnan(value):
+        return float("nan")
+    return float(value) / math.log(2.0)
+
+
+def total_nll_to_bpb(total_nll_nats: float | None, target_bytes: int) -> float | None:
+    if total_nll_nats is None:
+        return None
+    if target_bytes <= 0:
+        return None
+    total_nll_bits = nats_to_bits(total_nll_nats)
+    if total_nll_bits is None:
+        return None
+    return total_nll_bits / float(target_bytes)
+
+
+def loss_to_bpb(loss: float | None, target_tokens: int, target_bytes: int) -> float | None:
+    if loss is None:
+        return None
+    if target_tokens <= 0:
+        return None
+    return total_nll_to_bpb(float(loss) * float(target_tokens), target_bytes)
+
+
+def summarize_nll_metrics(
+    total_nll_nats: float,
+    target_tokens: int,
+    target_bytes: int,
+) -> tuple[float | None, float | None]:
+    if target_tokens <= 0:
+        return None, None
+    avg_loss = float(total_nll_nats) / float(target_tokens)
+    return avg_loss, total_nll_to_bpb(total_nll_nats, target_bytes)
+
+
+def eval_split_metrics(
+    model,
+    data: torch.Tensor | None,
+    seq_len: int,
+    device: torch.device,
+    max_steps: int,
+    *,
+    tokenizer,
+    tok_bytes_lut: torch.Tensor | None = None,
+) -> dict[str, float | int | None]:
+    was_training = model.training
+    if data is None or data.numel() <= seq_len + 1:
+        return {"loss": None, "bpb": None, "ppl": None, "windows": 0}
+    avg_loss, avg_bpb, n_win = run_val(
+        model,
+        data,
+        seq_len,
+        device,
+        max_steps,
+        tokenizer=tokenizer,
+        tok_bytes_lut=tok_bytes_lut,
+    )
+    if was_training:
+        model.train()
+    else:
+        model.eval()
+    if n_win <= 0:
+        return {"loss": None, "bpb": None, "ppl": None, "windows": 0}
+    return {
+        "loss": avg_loss,
+        "bpb": avg_bpb,
+        "ppl": loss_to_perplexity(avg_loss),
+        "windows": n_win,
+    }
+
+
+def capture_model_state_cpu(model) -> dict[str, torch.Tensor]:
+    return {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+
+def load_checkpoint_model_state_cpu(path: Path) -> dict[str, torch.Tensor]:
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    if "model" not in ckpt:
+        raise RuntimeError(f"checkpoint missing model state: {path}")
+    return {k: v.detach().cpu().clone() for k, v in ckpt["model"].items()}
+
+
+def infer_best_ckpt_path(resume: str | None) -> Path | None:
+    if not resume:
+        return None
+    resume_path = Path(resume).resolve()
+    cand = resume_path if resume_path.name == "ckpt_best.pt" else (resume_path.parent / "ckpt_best.pt")
+    return cand if cand.exists() else None
+
+
+def eval_model_state_metrics(
+    model,
+    state_cpu: dict[str, torch.Tensor] | None,
+    data: torch.Tensor | None,
+    seq_len: int,
+    device: torch.device,
+    max_steps: int,
+    *,
+    tokenizer,
+    tok_bytes_lut: torch.Tensor | None = None,
+    restore_state_cpu: dict[str, torch.Tensor] | None = None,
+) -> dict[str, float | int | None]:
+    if state_cpu is None:
+        return {"loss": None, "bpb": None, "ppl": None, "windows": 0}
+    was_training = model.training
+    restore_state = restore_state_cpu if restore_state_cpu is not None else capture_model_state_cpu(model)
+    try:
+        model.load_state_dict(state_cpu)
+        metrics = eval_split_metrics(
+            model,
+            data,
+            seq_len,
+            device,
+            max_steps,
+            tokenizer=tokenizer,
+            tok_bytes_lut=tok_bytes_lut,
+        )
+    finally:
+        model.load_state_dict(restore_state)
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+    return metrics
+
+
+def _build_token_byte_lut(tokenizer) -> torch.Tensor | None:
+    if getattr(tokenizer, "kind", "byte") == "byte":
+        return None
+    inner = getattr(tokenizer, "_tokenizer", None)
+    if inner is None or not hasattr(inner, "id_to_token"):
+        return None
+    vocab_size = int(tokenizer.vocab_size)
+    tok_bytes_lut = torch.empty(vocab_size, dtype=torch.int64)
+    for tok_id in range(vocab_size):
+        piece = inner.id_to_token(tok_id)
+        if piece is None:
+            raise RuntimeError(f"tokenizer returned no token piece for id={tok_id}")
+        tok_bytes_lut[tok_id] = len(piece)
+    return tok_bytes_lut
+
+
+def _count_token_bytes(
+    token_ids: torch.Tensor,
+    tokenizer,
+    tok_bytes_lut: torch.Tensor | None = None,
+) -> int:
+    if token_ids.numel() <= 0:
+        return 0
+    if getattr(tokenizer, "kind", "byte") == "byte":
+        return int(token_ids.numel())
+    if tok_bytes_lut is None:
+        tok_bytes_lut = _build_token_byte_lut(tokenizer)
+    if tok_bytes_lut is None:
+        flat_ids = token_ids.detach().reshape(-1).to(device="cpu", dtype=torch.long).tolist()
+        text = tokenizer.decode(flat_ids, skip_special_tokens=False)
+        return len(text.encode("utf-8", errors="replace"))
+    flat_ids = token_ids.detach().reshape(-1).to(device="cpu", dtype=torch.long)
+    max_id = int(flat_ids.max().item())
+    min_id = int(flat_ids.min().item())
+    if min_id < 0 or max_id >= int(tok_bytes_lut.numel()):
+        raise RuntimeError("token id out of range for tokenizer vocab")
+    tok_hist = torch.bincount(flat_ids, minlength=int(tok_bytes_lut.numel())).to(dtype=torch.int64)
+    return int(torch.dot(tok_hist, tok_bytes_lut.to(dtype=torch.int64)).item())
+
+
 def tokens_per_sec(tokens: int, dt: float) -> float | None:
     if tokens <= 0:
         return None
@@ -504,6 +688,8 @@ class CsvLog:
         "val_tok_s",
         "lr",
         "time_s",
+        "train_bpb",
+        "val_bpb",
     ]
     def __init__(self, path: str | None):
         self._file = None
@@ -529,6 +715,8 @@ class CsvLog:
         val_tok_s: float | None,
         lr: float,
         dt: float,
+        train_bpb: float | None = None,
+        val_bpb: float | None = None,
     ):
         if self._writer is None:
             return
@@ -542,6 +730,8 @@ class CsvLog:
             fmt_metric(val_tok_s, 2),
             f"{lr:.8f}",
             f"{dt:.1f}",
+            fmt_metric(train_bpb, 6),
+            fmt_metric(val_bpb, 6),
         ])
         self._file.flush()
     def close(self):
@@ -673,6 +863,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             test_data = torch.tensor(tokenizer.encode_text(test_text), dtype=torch.long)
         if cfg.tokenizer_path is not None and not Path(cfg.tokenizer_path).exists():
             tokenizer.save(cfg.tokenizer_path)
+    tok_bytes_lut = _build_token_byte_lut(tokenizer)
 
     min_train_tokens = cfg.seq_len + 2
     if train_data.numel() < min_train_tokens:
@@ -754,11 +945,15 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     global_step = 0
     best_val = None
     best_val_ep = 0
+    best_state_cpu = None
     if cfg.resume:
         ckpt = load_ckpt(Path(cfg.resume), model, opt, device)
         start_ep = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
         best_val = ckpt.get("best_val_loss", None)
+        best_ckpt_path = infer_best_ckpt_path(cfg.resume)
+        if best_ckpt_path is not None:
+            best_state_cpu = load_checkpoint_model_state_cpu(best_ckpt_path)
         print(f"resumed from {cfg.resume}  epoch={start_ep - 1}  step={global_step}")
     #====================
     # run directory setup
@@ -812,20 +1007,26 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     # training loop
     #====================
     first_loss = None
+    first_bpb = None
     last_loss = None
+    last_bpb = None
     best_train = None
     best_train_ep = 0
     last_epoch_train_loss = None
+    last_epoch_train_bpb = None
     last_epoch_train_ppl = None
     last_epoch_val_loss = None
+    last_epoch_val_bpb = None
     last_epoch_val_ppl = None
     last_epoch_train_tok_s = None
     last_epoch_val_tok_s = None
+    best_val_bpb = None
     model.train()
     for ep in range(start_ep, epochs + 1):
-        ep_loss = 0.0
         ep_n = 0
         ep_tokens = 0
+        ep_target_bytes = 0
+        ep_total_nll_nats = 0.0
         t0 = time.time()
         for step in range(1, steps_per_ep + 1):
             global_step += 1
@@ -862,16 +1063,27 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             if first_loss is None:
                 first_loss = train_loss
             last_loss = train_loss
-            ep_loss += train_loss
+            batch_tokens = int(y.numel())
+            batch_target_bytes = _count_token_bytes(y, tokenizer, tok_bytes_lut)
+            batch_total_nll_nats = train_loss * float(batch_tokens)
+            batch_bpb = total_nll_to_bpb(batch_total_nll_nats, batch_target_bytes)
+            if first_bpb is None:
+                first_bpb = batch_bpb
+            last_bpb = batch_bpb
+            ep_total_nll_nats += batch_total_nll_nats
             ep_n += 1
-            ep_tokens += int(y.numel())
+            ep_tokens += batch_tokens
+            ep_target_bytes += batch_target_bytes
             if step % cfg.log_every == 0 or step == steps_per_ep:
-                run_train_loss = ep_loss / ep_n
+                run_train_loss, run_train_bpb = summarize_nll_metrics(ep_total_nll_nats, ep_tokens, ep_target_bytes)
+                if run_train_loss is None:
+                    run_train_loss = 0.0
                 run_train_ppl = loss_to_perplexity(run_train_loss)
                 run_train_tok_s = tokens_per_sec(ep_tokens, time.time() - t0)
                 print(
                     f"  [{step}] "
                     f"train_loss={run_train_loss:.11f}  "
+                    f"train_bpb={fmt_metric(run_train_bpb, 4)}  "
                     f"train_ppl={fmt_metric(run_train_ppl, 4)}  "
                     f"tok/s={fmt_metric(run_train_tok_s, 1)}  "
                     f"lr={lr_now:.8f}"
@@ -880,28 +1092,42 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         # epoch end
         #====================
         ep_time = time.time() - t0
-        avg_train = ep_loss / max(ep_n, 1)
+        avg_train, train_bpb = summarize_nll_metrics(ep_total_nll_nats, ep_tokens, ep_target_bytes)
+        if avg_train is None:
+            avg_train = 0.0
         train_ppl = loss_to_perplexity(avg_train)
         train_tok_s = tokens_per_sec(ep_tokens, ep_time)
         last_epoch_train_loss = avg_train
+        last_epoch_train_bpb = train_bpb
         last_epoch_train_ppl = train_ppl
         last_epoch_train_tok_s = train_tok_s
         if best_train is None or avg_train < best_train:
             best_train = avg_train
             best_train_ep = ep
         t_val = time.time()
-        avg_val, n_val = run_val(model, val_data, cfg.seq_len, device, cfg.val_steps)
+        avg_val, val_bpb, n_val = run_val(
+            model,
+            val_data,
+            cfg.seq_len,
+            device,
+            cfg.val_steps,
+            tokenizer=tokenizer,
+            tok_bytes_lut=tok_bytes_lut,
+        )
         val_time = time.time() - t_val
         val_loss = avg_val if n_val > 0 else None
         val_ppl = loss_to_perplexity(val_loss)
         val_tok_s = tokens_per_sec(n_val * cfg.seq_len, val_time)
         last_epoch_val_loss = val_loss
+        last_epoch_val_bpb = val_bpb if n_val > 0 else None
         last_epoch_val_ppl = val_ppl
         last_epoch_val_tok_s = val_tok_s
         new_best = n_val > 0 and (best_val is None or avg_val < best_val)
         if new_best:
             best_val = avg_val
+            best_val_bpb = val_bpb
             best_val_ep = ep
+            best_state_cpu = capture_model_state_cpu(model)
         bt = best_train
         bv = best_val
         best_train_ppl = loss_to_perplexity(bt)
@@ -909,8 +1135,10 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         print(
             f"epoch {ep}/{epochs}  "
             f"train_loss={avg_train:.11f}  "
+            f"train_bpb={fmt_metric(train_bpb, 4)}  "
             f"train_ppl={fmt_metric(train_ppl, 4)}  "
             f"val_loss={fmt_metric(val_loss, 10)}  "
+            f"val_bpb={fmt_metric(val_bpb, 4)}  "
             f"val_ppl={fmt_metric(val_ppl, 4)}"
         )
         print(
@@ -919,12 +1147,25 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             f"best_train={fmt_metric(bt, 11)}@{best_train_ep} "
             f"(ppl={fmt_metric(best_train_ppl, 4)})  "
             f"best_val={fmt_metric(bv, 10)}@{best_val_ep} "
+            f"(bpb={fmt_metric(best_val_bpb, 4)})  "
             f"(ppl={fmt_metric(best_val_ppl, 4)})  "
             f"time={ep_time:.1f}s"
         )
         for line in model.format_qitnn_diagnostics(epoch=ep, full=(ep % cfg.diag_every == 0)):
             print(line)
-        log.row(ep, avg_train, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr_now, ep_time)
+        log.row(
+            ep,
+            avg_train,
+            train_ppl,
+            val_loss,
+            val_ppl,
+            train_tok_s,
+            val_tok_s,
+            lr_now,
+            ep_time,
+            train_bpb=train_bpb,
+            val_bpb=val_bpb,
+        )
         # save best checkpoint
         if run_dir is not None and new_best:
             save_ckpt(run_dir / "ckpt_best.pt", model, opt, ep, global_step, best_val,
@@ -958,21 +1199,63 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     #====================
     # test evaluation
     #====================
-    test_loss = None
-    test_ppl = None
-    if test_data is not None and test_data.numel() > cfg.seq_len + 1:
-        avg_test, n_test = run_val(model, test_data, cfg.seq_len, device, cfg.val_steps)
-        if n_test > 0:
-            test_loss = avg_test
-            test_ppl = loss_to_perplexity(test_loss)
-            print(
-                f"test_loss     {test_loss:.10f}  "
-                f"test_ppl={fmt_metric(test_ppl, 4)}  "
-                f"({n_test} windows)"
-            )
+    best_test_loss = None
+    best_test_bpb = None
+    best_test_ppl = None
+    final_test_loss = None
+    final_test_bpb = None
+    final_test_ppl = None
+    final_state_cpu = capture_model_state_cpu(model)
+    final_test_metrics = eval_split_metrics(
+        model,
+        test_data,
+        cfg.seq_len,
+        device,
+        cfg.val_steps,
+        tokenizer=tokenizer,
+        tok_bytes_lut=tok_bytes_lut,
+    )
+    best_test_metrics = eval_model_state_metrics(
+        model,
+        best_state_cpu,
+        test_data,
+        cfg.seq_len,
+        device,
+        cfg.val_steps,
+        tokenizer=tokenizer,
+        tok_bytes_lut=tok_bytes_lut,
+        restore_state_cpu=final_state_cpu,
+    )
+    final_test_windows = int(final_test_metrics["windows"])
+    best_test_windows = int(best_test_metrics["windows"])
+    if final_test_windows > 0:
+        final_test_loss = final_test_metrics["loss"]
+        final_test_bpb = final_test_metrics["bpb"]
+        final_test_ppl = final_test_metrics["ppl"]
+        print(
+            f"final_test_loss     {final_test_loss:.10f}  "
+            f"final_test_bpb={fmt_metric(final_test_bpb, 4)}  "
+            f"final_test_ppl={fmt_metric(final_test_ppl, 4)}  "
+            f"({final_test_windows} windows)"
+        )
+    if best_test_windows > 0:
+        best_test_loss = best_test_metrics["loss"]
+        best_test_bpb = best_test_metrics["bpb"]
+        best_test_ppl = best_test_metrics["ppl"]
+        print(
+            f"best_test_loss      {best_test_loss:.10f}  "
+            f"best_test_bpb={fmt_metric(best_test_bpb, 4)}  "
+            f"best_test_ppl={fmt_metric(best_test_ppl, 4)}  "
+            f"({best_test_windows} windows)"
+        )
+    test_loss = final_test_loss
+    test_bpb = final_test_bpb
+    test_ppl = final_test_ppl
     log.close()
     print("first_loss", first_loss)
+    print("first_bpb", first_bpb)
     print("last_loss", last_loss)
+    print("last_bpb", last_bpb)
     print("first_ppl", loss_to_perplexity(first_loss))
     print("last_ppl", loss_to_perplexity(last_loss))
     #====================
@@ -1019,16 +1302,28 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             print("generated_text_end")
     return {
         "first_loss": first_loss,
+        "first_bpb": first_bpb,
         "first_ppl": loss_to_perplexity(first_loss),
         "last_loss": last_loss,
+        "last_bpb": last_bpb,
         "last_ppl": loss_to_perplexity(last_loss),
         "best_val": best_val,
+        "best_val_bpb": best_val_bpb,
         "best_val_ppl": loss_to_perplexity(best_val),
+        "best_test_loss": best_test_loss,
+        "best_test_bpb": best_test_bpb,
+        "best_test_ppl": best_test_ppl,
+        "final_test_loss": final_test_loss,
+        "final_test_bpb": final_test_bpb,
+        "final_test_ppl": final_test_ppl,
         "test_loss": test_loss,
+        "test_bpb": test_bpb,
         "test_ppl": test_ppl,
         "last_epoch_train_loss": last_epoch_train_loss,
+        "last_epoch_train_bpb": last_epoch_train_bpb,
         "last_epoch_train_ppl": last_epoch_train_ppl,
         "last_epoch_val_loss": last_epoch_val_loss,
+        "last_epoch_val_bpb": last_epoch_val_bpb,
         "last_epoch_val_ppl": last_epoch_val_ppl,
         "last_epoch_train_tok_s": last_epoch_train_tok_s,
         "last_epoch_val_tok_s": last_epoch_val_tok_s,
