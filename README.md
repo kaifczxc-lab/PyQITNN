@@ -1,3 +1,7 @@
+<img width="1918" height="417" alt="PyQITNN(1)" src="https://github.com/user-attachments/assets/b342240e-260e-49d0-aeb4-3565cf7d449f" />
+
+
+
 # PyQITNN
 
 A PyTorch library implementing quantum-inspired ternary neural network layers.
