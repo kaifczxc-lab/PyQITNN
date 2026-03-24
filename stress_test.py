@@ -29,11 +29,17 @@ from BasicQITNN_Transformer import (
     _count_token_bytes,
     _parse_cli,
     _resolve_precision_mode_cfg,
+    _resolve_warmup_steps,
+    _schedule_progress,
     eval_split_metrics,
     load_bytes,
+    lr_cosine,
+    lr_linear,
+    lr_with_warmup,
     loss_to_bpb,
     loss_to_perplexity,
     run_val,
+    sample_batch,
     total_nll_to_bpb,
     train,
 )
@@ -367,6 +373,113 @@ def test_attention2_batched_consistency():
 
     max_err = (out_batch - out_loop).abs().max().item()
     check(f"batched vs loop: max_err={max_err:.2e}", max_err < 1e-5, f"err={max_err}")
+
+
+#====================
+# 7. Native attention2 bridge batched: direct 3D bridge path must match per-sample native calls
+#====================
+
+def test_native_attention2_batched_bridge_consistency():
+    print("\n=== test_native_attention2_batched_bridge_consistency ===")
+    torch.manual_seed(56)
+    ext = load_native()
+    B, S, D = 3, 12, 16
+    dtypes = [torch.float32]
+    if torch.cuda.is_bf16_supported():
+        dtypes.append(torch.bfloat16)
+
+    for dtype in dtypes:
+        qx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        qy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        kx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        ky = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+
+        ox_batch, oy_batch = ext.attention2_cuda(qx, qy, kx, ky, vx, vy)
+        ox_loop = []
+        oy_loop = []
+        for b in range(B):
+            ox_b, oy_b = ext.attention2_cuda(
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            ox_loop.append(ox_b)
+            oy_loop.append(oy_b)
+        ox_ref = torch.stack(ox_loop, dim=0)
+        oy_ref = torch.stack(oy_loop, dim=0)
+
+        dox = torch.randn_like(ox_batch, dtype=torch.float32).to(dtype)
+        doy = torch.randn_like(oy_batch, dtype=torch.float32).to(dtype)
+        grads_batch = ext.attention_backward2_cuda(dox, doy, qx, qy, kx, ky, vx, vy)
+        grads_loop = [[] for _ in range(6)]
+        for b in range(B):
+            grads_b = ext.attention_backward2_cuda(
+                dox[b].contiguous(), doy[b].contiguous(),
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            for i, t in enumerate(grads_b):
+                grads_loop[i].append(t)
+        grads_ref = tuple(torch.stack(parts, dim=0) for parts in grads_loop)
+
+        fwd_err = max((ox_batch - ox_ref).abs().max().item(), (oy_batch - oy_ref).abs().max().item())
+        bwd_err = max((gb - gr).abs().max().item() for gb, gr in zip(grads_batch, grads_ref))
+        tol = 1e-6 if dtype == torch.float32 else 1e-3
+
+        check(
+            f"native batched attention2 bridge forward matches per-sample native loop [{str(dtype).split('.')[-1]}]",
+            fwd_err < tol,
+            f"max_err={fwd_err:.3e}"
+        )
+        check(
+            f"native batched attention2 bridge backward matches per-sample native loop [{str(dtype).split('.')[-1]}]",
+            bwd_err < tol,
+            f"max_err={bwd_err:.3e}"
+        )
+
+
+def test_native_attention2_backward_reuse_smoke():
+    print("\n=== test_native_attention2_backward_reuse_smoke ===")
+    torch.manual_seed(57)
+    ext = load_native()
+
+    shapes = [
+        (2, 8, 12),
+        (4, 16, 24),
+        (2, 8, 12),
+    ]
+
+    for B, S, D in shapes:
+        qx = torch.randn(B, S, D, device=DEVICE)
+        qy = torch.randn(B, S, D, device=DEVICE)
+        kx = torch.randn(B, S, D, device=DEVICE)
+        ky = torch.randn(B, S, D, device=DEVICE)
+        vx = torch.randn(B, S, D, device=DEVICE)
+        vy = torch.randn(B, S, D, device=DEVICE)
+        dox = torch.randn(B, S, D, device=DEVICE)
+        doy = torch.randn(B, S, D, device=DEVICE)
+
+        grads_batch = ext.attention_backward2_cuda(dox, doy, qx, qy, kx, ky, vx, vy)
+        grads_loop = [[] for _ in range(6)]
+        for b in range(B):
+            grads_b = ext.attention_backward2_cuda(
+                dox[b].contiguous(), doy[b].contiguous(),
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            for i, t in enumerate(grads_b):
+                grads_loop[i].append(t)
+        grads_ref = tuple(torch.stack(parts, dim=0) for parts in grads_loop)
+        max_err = max((gb - gr).abs().max().item() for gb, gr in zip(grads_batch, grads_ref))
+        check(
+            f"native attention backward scratch reuse keeps batched parity [{B}x{S}x{D}]",
+            max_err < 1e-6,
+            f"max_err={max_err:.3e}"
+        )
 
 
 #====================
@@ -940,7 +1053,278 @@ def test_mixed_precision_cli_defaults():
 
 
 #====================
-# 19. High-level precision_mode: layer/model constructors must accept the new mode contract
+# sample_batch contract: vectorized sampling must preserve next-token window semantics
+#====================
+
+def test_sample_batch_contract():
+    print("\n=== test_sample_batch_contract ===")
+
+    data = torch.arange(16, dtype=torch.long)
+    starts = torch.tensor([0, 3, 3, 11], dtype=torch.long)
+    expected_x = torch.tensor([
+        [0, 1, 2, 3],
+        [3, 4, 5, 6],
+        [3, 4, 5, 6],
+        [11, 12, 13, 14],
+    ], dtype=torch.long)
+    expected_y = torch.tensor([
+        [1, 2, 3, 4],
+        [4, 5, 6, 7],
+        [4, 5, 6, 7],
+        [12, 13, 14, 15],
+    ], dtype=torch.long)
+
+    with patch("BasicQITNN_Transformer.torch.randint", return_value=starts):
+        x, y = sample_batch(data, batch=4, seq_len=4, device=DEVICE)
+
+    x_cpu = x.cpu()
+    y_cpu = y.cpu()
+    check("sample_batch preserves x window slices", torch.equal(x_cpu, expected_x), f"x={x_cpu.tolist()}")
+    check("sample_batch preserves y next-token shift", torch.equal(y_cpu, expected_y), f"y={y_cpu.tolist()}")
+    check("sample_batch keeps duplicate starts stable", torch.equal(x_cpu[1], x_cpu[2]) and torch.equal(y_cpu[1], y_cpu[2]), f"x={x_cpu.tolist()} y={y_cpu.tolist()}")
+    check("sample_batch returns requested device", x.device == DEVICE and y.device == DEVICE, f"x.device={x.device} y.device={y.device}")
+    check("sample_batch keeps long dtype", x.dtype == torch.long and y.dtype == torch.long, f"x.dtype={x.dtype} y.dtype={y.dtype}")
+
+
+#====================
+# 19. Warmup contract: scheduler warmup must be explicit, reversible, and CLI-addressable
+#====================
+
+def test_warmup_schedule_contract():
+    """warmup must preserve legacy behavior at 0 and apply a clean linear ramp when enabled"""
+    print("\n=== test_warmup_schedule_contract ===")
+
+    default_cfg = TrainConfig()
+    cli_cfg = _parse_cli(["--warmup-steps", "7"])
+    neg_msg = capture_runtime_error(lambda: _resolve_warmup_steps(-1))
+
+    check("TrainConfig default keeps warmup disabled", default_cfg.warmup_steps == 0, f"warmup_steps={default_cfg.warmup_steps}")
+    check("CLI parses warmup_steps", cli_cfg.warmup_steps == 7, f"warmup_steps={cli_cfg.warmup_steps}")
+    check("negative warmup is rejected", ">= 0" in neg_msg, neg_msg or "no RuntimeError")
+
+    linear_legacy = [lr_linear(1.0, 0.1, i / 9.0) for i in range(10)]
+    linear_nowarm = [lr_with_warmup(1.0, 0.1, i, 10, warmup_steps=0, schedule_fn=lr_linear) for i in range(10)]
+    cosine_legacy = [lr_cosine(1.0, 0.1, i / 9.0) for i in range(10)]
+    cosine_nowarm = [lr_with_warmup(1.0, 0.1, i, 10, warmup_steps=0, schedule_fn=lr_cosine) for i in range(10)]
+    linear_diff = max(abs(a - b) for a, b in zip(linear_legacy, linear_nowarm))
+    cosine_diff = max(abs(a - b) for a, b in zip(cosine_legacy, cosine_nowarm))
+
+    check("warmup=0 preserves linear schedule", linear_diff < 1e-12, f"max_diff={linear_diff:.3e}")
+    check("warmup=0 preserves cosine schedule", cosine_diff < 1e-12, f"max_diff={cosine_diff:.3e}")
+
+    warm = [lr_with_warmup(1.0, 0.1, i, 10, warmup_steps=3, schedule_fn=lr_linear) for i in range(10)]
+    progress = [_schedule_progress(i, 10, 3) for i in range(10)]
+    full_warm = [lr_with_warmup(0.4, 0.1, i, 4, warmup_steps=10, schedule_fn=lr_linear) for i in range(4)]
+
+    check("warmup step 1 ramps from zero", abs(warm[0] - (1.0 / 3.0)) < 1e-9, f"lr={warm[0]:.12f}")
+    check("warmup reaches base LR at the warmup boundary", abs(warm[2] - 1.0) < 1e-9, f"lr={warm[2]:.12f}")
+    check("first post-warmup step starts decay from base LR", abs(warm[3] - 1.0) < 1e-9, f"lr={warm[3]:.12f}")
+    check("warmup schedule still ends at lr_end", abs(warm[-1] - 0.1) < 1e-9, f"lr={warm[-1]:.12f}")
+    check("decay progress stays frozen during warmup prefix", progress[:4] == [0.0, 0.0, 0.0, 0.0], f"progress={progress[:4]}")
+    check("full-run warmup ramps cleanly when warmup exceeds total steps", all(full_warm[i] < full_warm[i + 1] for i in range(len(full_warm) - 1)) and abs(full_warm[-1] - 0.4) < 1e-9, f"full_warm={full_warm}")
+
+
+#====================
+# 20. Warmup trainer smoke: real train() runs must surface warmup in saved artifacts
+#====================
+
+def test_warmup_trainer_csv_smoke():
+    print("\n=== test_warmup_trainer_csv_smoke ===")
+
+    tmp_path = ROOT / "_tmp_warmup_dataset.txt"
+    save_dir = ROOT / "_tmp_warmup_runs"
+    run_name = "warmup_csv_smoke"
+    metrics_ok = False
+    config_ok = False
+    lr_rows_ok = False
+    metrics_detail = ""
+    config_detail = ""
+    lr_detail = ""
+
+    text = (
+        "hello simplex warmup trainer csv smoke path\n"
+        "product artifact contract should expose lr schedule cleanly\n"
+    ) * 64
+
+    try:
+        shutil.rmtree(save_dir, ignore_errors=True)
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="fp32",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            optimizer="adamw",
+            adamw_lr_start=3e-4,
+            adamw_lr_end=3e-5,
+            lr_schedule="linear",
+            warmup_steps=2,
+            epochs=5,
+            steps_per_epoch=1,
+            save_dir=str(save_dir),
+            run_name=run_name,
+            save_every=999,
+            no_interactive=True,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=0,
+            log_every=1,
+        )
+
+        run_dir = Path(result["run_dir"])
+        metrics_path = run_dir / "metrics.csv"
+        config_path = run_dir / "config.json"
+        metrics_ok = metrics_path.exists()
+        config_ok = config_path.exists()
+        metrics_detail = str(metrics_path)
+        config_detail = str(config_path)
+
+        if metrics_ok:
+            with open(metrics_path, "r", encoding="utf-8", newline="") as f:
+                rows = list(csv.DictReader(f))
+            logged_lrs = [row.get("lr", "") for row in rows]
+            expected_lrs = ["0.00015000", "0.00030000", "0.00030000", "0.00016500", "0.00003000"]
+            lr_rows_ok = logged_lrs == expected_lrs
+            lr_detail = f"logged_lrs={logged_lrs}"
+        else:
+            lr_detail = "metrics.csv missing"
+
+        if config_ok:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            config_ok = (
+                int(cfg.get("warmup_steps", -1)) == 2
+                and cfg.get("lr_schedule") == "linear"
+                and cfg.get("precision_mode") == "fp32"
+            )
+            config_detail = json.dumps(
+                {
+                    "warmup_steps": cfg.get("warmup_steps"),
+                    "lr_schedule": cfg.get("lr_schedule"),
+                    "precision_mode": cfg.get("precision_mode"),
+                },
+                ensure_ascii=False,
+            )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(save_dir, ignore_errors=True)
+
+    check("warmup trainer saved metrics.csv", metrics_ok, metrics_detail)
+    check("warmup trainer saved config.json with warmup contract", config_ok, config_detail)
+    check("warmup trainer logs per-epoch LR schedule with warmup", lr_rows_ok, lr_detail)
+
+
+#====================
+# 21. Warmup resume smoke: resumed runs must continue the LR schedule from saved global_step
+#====================
+
+def test_warmup_resume_schedule_smoke():
+    print("\n=== test_warmup_resume_schedule_smoke ===")
+
+    tmp_path = ROOT / "_tmp_warmup_resume_dataset.txt"
+    save_dir = ROOT / "_tmp_warmup_resume_runs"
+    run_name_a = "warmup_resume_a"
+    run_name_b = "warmup_resume_b"
+    ckpt_ok = False
+    metrics_ok = False
+    lr_rows_ok = False
+    ckpt_detail = ""
+    metrics_detail = ""
+    lr_detail = ""
+
+    text = (
+        "hello simplex warmup resume schedule smoke path\n"
+        "resume should continue from saved global_step without restarting lr warmup\n"
+    ) * 64
+
+    try:
+        shutil.rmtree(save_dir, ignore_errors=True)
+        tmp_path.write_text(text, encoding="utf-8")
+        base = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="fp32",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            optimizer="adamw",
+            adamw_lr_start=3e-4,
+            adamw_lr_end=3e-5,
+            lr_schedule="linear",
+            warmup_steps=2,
+            epochs=5,
+            steps_per_epoch=1,
+            save_dir=str(save_dir),
+            run_name=run_name_a,
+            save_every=1,
+            no_interactive=True,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=0,
+            log_every=1,
+        )
+
+        ckpt_path = Path(base["run_dir"]) / "ckpt_ep2.pt"
+        ckpt_ok = ckpt_path.exists()
+        ckpt_detail = str(ckpt_path)
+
+        if ckpt_ok:
+            resumed = train(
+                dataset=str(tmp_path),
+                tokenizer="byte",
+                precision_mode="fp32",
+                dim=16,
+                ffn=32,
+                layers=1,
+                seq_len=16,
+                batch_size=1,
+                optimizer="adamw",
+                adamw_lr_start=3e-4,
+                adamw_lr_end=3e-5,
+                lr_schedule="linear",
+                warmup_steps=2,
+                epochs=5,
+                steps_per_epoch=1,
+                resume=str(ckpt_path),
+                save_dir=str(save_dir),
+                run_name=run_name_b,
+                save_every=1,
+                no_interactive=True,
+                prompt="hello simplex",
+                prompt_bytes=16,
+                gen_bytes=0,
+                log_every=1,
+            )
+            metrics_path = Path(resumed["run_dir"]) / "metrics.csv"
+            metrics_ok = metrics_path.exists()
+            metrics_detail = str(metrics_path)
+            if metrics_ok:
+                with open(metrics_path, "r", encoding="utf-8", newline="") as f:
+                    rows = list(csv.DictReader(f))
+                logged_lrs = [row.get("lr", "") for row in rows]
+                expected_lrs = ["0.00030000", "0.00016500", "0.00003000"]
+                lr_rows_ok = logged_lrs == expected_lrs
+                lr_detail = f"logged_lrs={logged_lrs}"
+            else:
+                lr_detail = "metrics.csv missing"
+        else:
+            lr_detail = "resume checkpoint missing"
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(save_dir, ignore_errors=True)
+
+    check("warmup base run saved ckpt_ep2.pt", ckpt_ok, ckpt_detail)
+    check("warmup resumed run saved metrics.csv", metrics_ok, metrics_detail)
+    check("warmup resumed run continues LR schedule from checkpoint step", lr_rows_ok, lr_detail)
+
+
+#====================
+# 22. High-level precision_mode: layer/model constructors must accept the new mode contract
 #====================
 
 def test_precision_mode_high_level_api():
@@ -1960,6 +2344,46 @@ def test_run_val_bpb_aggregation():
 
 
 #====================
+# run_val batching contract: validation should preserve metrics while grouping windows
+#====================
+
+def test_run_val_batches_windows():
+    print("\n=== test_run_val_batches_windows ===")
+    tok = pyqitnn.ByteTokenizer()
+    val_data = torch.tensor([65, 66, 67, 68, 69, 70, 71], dtype=torch.long)
+    loss_value = math.log(2.0)
+
+    class BatchRecordingLossModel(torch.nn.Module):
+        def __init__(self, loss_value: float) -> None:
+            super().__init__()
+            self.loss_value = float(loss_value)
+            self.batch_sizes: list[int] = []
+
+        def forward(self, x, targets=None):
+            del targets
+            self.batch_sizes.append(int(x.size(0)))
+            loss = torch.tensor(self.loss_value, device=x.device, dtype=torch.float32)
+            return x, loss
+
+    model = BatchRecordingLossModel(loss_value)
+    avg_loss, avg_bpb, n_win = run_val(
+        model,
+        val_data,
+        seq_len=2,
+        device=DEVICE,
+        max_steps=0,
+        tokenizer=tok,
+        tok_bytes_lut=None,
+    )
+
+    check("run_val batched path keeps window count", n_win == 3, f"n_win={n_win}")
+    check("run_val batched path keeps exact mean loss", abs(avg_loss - loss_value) < 1e-6, f"loss={avg_loss}")
+    check("run_val batched path keeps exact byte BPB", avg_bpb is not None and abs(avg_bpb - 1.0) < 1e-6, f"bpb={avg_bpb}")
+    check("run_val now groups multiple windows per model call", max(model.batch_sizes, default=0) > 1, f"batch_sizes={model.batch_sizes}")
+    check("run_val batched path accounts for every window once", sum(model.batch_sizes) == n_win, f"batch_sizes={model.batch_sizes} n_win={n_win}")
+
+
+#====================
 # 39. Split-eval helper: wrapper should expose loss/BPB/PPL/windows consistently
 #====================
 
@@ -2132,6 +2556,8 @@ if __name__ == "__main__":
     test_backnorm_full_fd()
     test_attention2_vs_sdpa()
     test_attention2_batched_consistency()
+    test_native_attention2_batched_bridge_consistency()
+    test_native_attention2_backward_reuse_smoke()
     test_prior_raises_entropy()
     test_prior_no_overshoot()
     test_full_model_gradient_flow()
@@ -2148,6 +2574,10 @@ if __name__ == "__main__":
     test_qitnn_linear_mixed_precision_forces_bf16()
     test_model_mixed_precision_smoke()
     test_mixed_precision_cli_defaults()
+    test_sample_batch_contract()
+    test_warmup_schedule_contract()
+    test_warmup_trainer_csv_smoke()
+    test_warmup_resume_schedule_smoke()
     test_precision_mode_high_level_api()
     test_precision_mode_low_level_api()
     test_native_mixed_bridge_smoke()
@@ -2164,6 +2594,7 @@ if __name__ == "__main__":
     test_bpb_bpe_byte_accounting()
     test_bpb_total_aggregation_math()
     test_run_val_bpb_aggregation()
+    test_run_val_batches_windows()
     test_eval_split_metrics_helper()
     test_bpe_trainer_smoke()
     test_mixed_precision_trainer_smoke()

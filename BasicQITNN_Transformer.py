@@ -55,7 +55,7 @@ class TrainConfig:
     # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
     #====================
-    dataset: str | Path = r"YOUR_LINK"   # path to a file or directory with training data
+    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
@@ -96,6 +96,7 @@ class TrainConfig:
     lr_start: float = 0.005          # SGD only
     lr_end: float = 0.001            # SGD only
     lr_schedule: str = "cosine"      # "cosine" or "linear"
+    warmup_steps: int = 0            # optimizer steps for linear LR warmup before decay
     #====================
     # zero-boost
     # multiplier for a_zero learning rate
@@ -344,12 +345,10 @@ def split_train_val_raw(raw: bytes, val_div: int):
 def sample_batch(data: torch.Tensor, batch: int, seq_len: int, device: torch.device):
     hi = data.numel() - seq_len - 1
     starts = torch.randint(0, hi + 1, (batch,))
-    x = torch.empty((batch, seq_len), dtype=torch.long)
-    y = torch.empty((batch, seq_len), dtype=torch.long)
-    for i, s in enumerate(starts.tolist()):
-        chunk = data[s : s + seq_len + 1]
-        x[i] = chunk[:-1]
-        y[i] = chunk[1:]
+    windows = data.unfold(0, seq_len + 1, 1)
+    chunks = windows.index_select(0, starts)
+    x = chunks[:, :-1].contiguous()
+    y = chunks[:, 1:].contiguous()
     return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 #====================
 # validation
@@ -377,11 +376,12 @@ def run_val(
     total_nll_nats = 0.0
     total_target_tokens = 0
     total_target_bytes = 0
-    for i in range(n_win):
-        s = i * seq_len
-        chunk = val_data[s : s + seq_len + 1]
-        xv = chunk[:-1].unsqueeze(0).to(device, non_blocking=True)
-        yv = chunk[1:].unsqueeze(0)
+    windows = val_data.unfold(0, seq_len + 1, seq_len)[:n_win]
+    batch_windows = min(8, n_win)
+    for start in range(0, n_win, batch_windows):
+        chunk = windows[start : start + batch_windows]
+        xv = chunk[:, :-1].contiguous().to(device, non_blocking=True)
+        yv = chunk[:, 1:].contiguous()
         _, loss = model(xv, targets=yv.to(device, non_blocking=True))
         target_tokens = int(yv.numel())
         total_nll_nats += float(loss.detach().cpu()) * float(target_tokens)
@@ -455,6 +455,52 @@ def lr_linear(a: float, b: float, t: float) -> float:
     return a + (b - a) * t
 def lr_cosine(a: float, b: float, t: float) -> float:
     return b + 0.5 * (a - b) * (1.0 + math.cos(math.pi * t))
+
+
+def _resolve_warmup_steps(value: int | None) -> int:
+    if value is None:
+        return 0
+    warmup = int(value)
+    if warmup < 0:
+        raise RuntimeError("warmup_steps must be >= 0")
+    return warmup
+
+
+def _schedule_progress(step_index: int, total_steps: int, warmup_steps: int = 0) -> float:
+    total = max(int(total_steps), 1)
+    idx = min(max(int(step_index), 0), total - 1)
+    warmup = _resolve_warmup_steps(warmup_steps)
+
+    if total <= 1 or warmup >= total:
+        return 0.0
+    if idx < warmup:
+        return 0.0
+
+    tail_steps = total - warmup
+    tail_idx = idx - warmup
+    if tail_steps <= 1:
+        return 1.0
+    return min(max(tail_idx / float(tail_steps - 1), 0.0), 1.0)
+
+
+def lr_with_warmup(
+    a: float,
+    b: float,
+    step_index: int,
+    total_steps: int,
+    *,
+    warmup_steps: int = 0,
+    schedule_fn=lr_cosine,
+) -> float:
+    total = max(int(total_steps), 1)
+    idx = min(max(int(step_index), 0), total - 1)
+    warmup = _resolve_warmup_steps(warmup_steps)
+    target = schedule_fn(a, b, _schedule_progress(idx, total, warmup))
+    ramp_steps = min(warmup, total)
+
+    if ramp_steps > 0 and idx < ramp_steps:
+        return target * float(idx + 1) / float(ramp_steps)
+    return target
 
 
 def loss_to_perplexity(loss: float | None) -> float | None:
@@ -796,6 +842,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         raise RuntimeError("tokenizer must be 'byte' or 'bpe'")
 
     sched = lr_cosine if cfg.lr_schedule == "cosine" else lr_linear
+    warmup_steps = _resolve_warmup_steps(cfg.warmup_steps)
     interactive = False
     if cfg.no_interactive:
         interactive = False
@@ -1030,8 +1077,16 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         t0 = time.time()
         for step in range(1, steps_per_ep + 1):
             global_step += 1
-            frac = 0.0 if total_steps <= 1 else (global_step - 1) / (total_steps - 1)
-            lr_now = sched(lr_start, lr_end, frac)
+            step_idx = global_step - 1
+            frac = _schedule_progress(step_idx, total_steps, warmup_steps)
+            lr_now = lr_with_warmup(
+                lr_start,
+                lr_end,
+                step_idx,
+                total_steps,
+                warmup_steps=warmup_steps,
+                schedule_fn=sched,
+            )
             fm_qk  = sched(fm_qk_s, fm_qk_e, frac)
             fm_vo  = sched(fm_vo_s, fm_vo_e, frac)
             fm_ff  = sched(fm_ff_s, fm_ff_e, frac)
@@ -1376,6 +1431,7 @@ def _parse_cli(args: list[str] | None = None) -> TrainConfig:
     p.add_argument("--lr-start",     type=float, default=D.lr_start)
     p.add_argument("--lr-end",       type=float, default=D.lr_end)
     p.add_argument("--lr-schedule",  type=str,   default=D.lr_schedule, choices=("linear", "cosine"))
+    p.add_argument("--warmup-steps", type=int,   default=D.warmup_steps)
     # zero-boost
     p.add_argument("--zero-boost",      type=float, default=D.zero_boost)
     p.add_argument("--zero-boost-qk",   type=float, default=None)

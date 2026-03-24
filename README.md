@@ -89,7 +89,7 @@ pip install pyqitnn[tokenizers] --no-deps
 import pyqitnn
 
 status = pyqitnn.bridge_status()
-print(pyqitnn.__version__)        # e.g. 0.3.6
+print(pyqitnn.__version__)        # e.g. 0.3.8
 print(status["native_found"])     # True
 print(status["native_loadable"])  # True
 ```
@@ -246,6 +246,22 @@ The training script accepts plain text as well as structured JSON corpora.
 
 For JSON inputs, the trainer can either collect all string leaves recursively or prefer
 specific fields such as `text,content`.
+
+### Trainer LR warmup
+
+The standalone trainer supports `warmup_steps` for optimizer LR warmup.
+
+- `warmup_steps=0` keeps the legacy schedule exactly.
+- `warmup_steps=N` linearly ramps LR from `0` to the configured start LR during the
+  first `N` optimizer steps.
+- After warmup, the selected `lr_schedule` (`linear` or `cosine`) decays toward the
+  configured end LR.
+- If `warmup_steps` is longer than the whole run, the run becomes a clean ramp to
+  the configured start LR.
+
+```bash
+python BasicQITNN_Transformer.py --optimizer adamw --adamw-lr-start 3e-4 --adamw-lr-end 3e-5 --lr-schedule cosine --warmup-steps 200 --no-interactive
+```
 
 ---
 

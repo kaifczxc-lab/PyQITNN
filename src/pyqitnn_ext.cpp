@@ -26,6 +26,19 @@ void check_cuda_amp_2d(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+void check_cuda_amp_2d_or_3d(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(
+        t.scalar_type() == torch::kFloat32 ||
+        t.scalar_type() == torch::kFloat16 ||
+        t.scalar_type() == torch::kBFloat16,
+        name,
+        " must be float32, float16, or bfloat16"
+    );
+    TORCH_CHECK(t.dim() == 2 || t.dim() == 3, name, " must be 2D or 3D");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
 void check_same_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name, const char* b_name) {
     TORCH_CHECK(a.sizes() == b.sizes(), a_name, " shape must match ", b_name);
 }
@@ -203,6 +216,64 @@ std::tuple<torch::Tensor, torch::Tensor> centered_simplex_cuda(
     return {out_x, out_y};
 }
 
+void attention2_launch_2d(
+    const torch::Tensor& qx,
+    const torch::Tensor& qy,
+    const torch::Tensor& kx,
+    const torch::Tensor& ky,
+    const torch::Tensor& vx,
+    const torch::Tensor& vy,
+    torch::Tensor& ox,
+    torch::Tensor& oy
+) {
+    const auto seq_len = static_cast<int>(qx.size(0));
+    const auto dim = static_cast<int>(qx.size(1));
+    Qitnn_DeviceAttention2Ex(
+        qx.data_ptr(),
+        qy.data_ptr(),
+        kx.data_ptr(),
+        ky.data_ptr(),
+        vx.data_ptr(),
+        vy.data_ptr(),
+        tensor_dtype_code(qx),
+        ox.data_ptr(),
+        oy.data_ptr(),
+        tensor_dtype_code(ox),
+        seq_len,
+        dim
+    );
+}
+
+void attention2_launch_3d(
+    const torch::Tensor& qx,
+    const torch::Tensor& qy,
+    const torch::Tensor& kx,
+    const torch::Tensor& ky,
+    const torch::Tensor& vx,
+    const torch::Tensor& vy,
+    torch::Tensor& ox,
+    torch::Tensor& oy
+) {
+    const auto batch = static_cast<int>(qx.size(0));
+    const auto seq_len = static_cast<int>(qx.size(1));
+    const auto dim = static_cast<int>(qx.size(2));
+    Qitnn_DeviceAttention2BatchedEx(
+        qx.data_ptr(),
+        qy.data_ptr(),
+        kx.data_ptr(),
+        ky.data_ptr(),
+        vx.data_ptr(),
+        vy.data_ptr(),
+        tensor_dtype_code(qx),
+        ox.data_ptr(),
+        oy.data_ptr(),
+        tensor_dtype_code(ox),
+        batch,
+        seq_len,
+        dim
+    );
+}
+
 std::tuple<torch::Tensor, torch::Tensor> attention2_cuda(
     torch::Tensor qx,
     torch::Tensor qy,
@@ -211,12 +282,12 @@ std::tuple<torch::Tensor, torch::Tensor> attention2_cuda(
     torch::Tensor vx,
     torch::Tensor vy
 ) {
-    check_cuda_amp_2d(qx, "qx");
-    check_cuda_amp_2d(qy, "qy");
-    check_cuda_amp_2d(kx, "kx");
-    check_cuda_amp_2d(ky, "ky");
-    check_cuda_amp_2d(vx, "vx");
-    check_cuda_amp_2d(vy, "vy");
+    check_cuda_amp_2d_or_3d(qx, "qx");
+    check_cuda_amp_2d_or_3d(qy, "qy");
+    check_cuda_amp_2d_or_3d(kx, "kx");
+    check_cuda_amp_2d_or_3d(ky, "ky");
+    check_cuda_amp_2d_or_3d(vx, "vx");
+    check_cuda_amp_2d_or_3d(vy, "vy");
 
     check_same_shape(qx, qy, "qx", "qy");
     check_same_shape(qx, kx, "qx", "kx");
@@ -236,28 +307,98 @@ std::tuple<torch::Tensor, torch::Tensor> attention2_cuda(
     TORCH_CHECK(vx.get_device() == 0, "attention2 bridge currently supports only cuda:0");
     TORCH_CHECK(vy.get_device() == 0, "attention2 bridge currently supports only cuda:0");
 
-    const auto seq_len = static_cast<int>(qx.size(0));
-    const auto dim = static_cast<int>(qx.size(1));
-
     auto ox = torch::empty_like(qx);
     auto oy = torch::empty_like(qy);
 
-    Qitnn_DeviceAttention2Ex(
+    if (qx.dim() == 2) {
+        attention2_launch_2d(qx, qy, kx, ky, vx, vy, ox, oy);
+        return {ox, oy};
+    }
+
+    attention2_launch_3d(qx, qy, kx, ky, vx, vy, ox, oy);
+    return {ox, oy};
+}
+
+void attention_backward2_launch_2d(
+    torch::Tensor& dqx,
+    torch::Tensor& dqy,
+    torch::Tensor& dkx,
+    torch::Tensor& dky,
+    torch::Tensor& dvx,
+    torch::Tensor& dvy,
+    const torch::Tensor& qx,
+    const torch::Tensor& qy,
+    const torch::Tensor& kx,
+    const torch::Tensor& ky,
+    const torch::Tensor& vx,
+    const torch::Tensor& vy,
+    const torch::Tensor& dox,
+    const torch::Tensor& doy
+) {
+    const auto seq_len = static_cast<int>(qx.size(0));
+    const auto dim = static_cast<int>(qx.size(1));
+    Qitnn_DeviceAttentionBackward2Ex(
+        dqx.data_ptr(),
+        dqy.data_ptr(),
+        dkx.data_ptr(),
+        dky.data_ptr(),
+        dvx.data_ptr(),
+        dvy.data_ptr(),
+        tensor_dtype_code(dqx),
         qx.data_ptr(),
         qy.data_ptr(),
         kx.data_ptr(),
         ky.data_ptr(),
         vx.data_ptr(),
         vy.data_ptr(),
+        dox.data_ptr(),
+        doy.data_ptr(),
         tensor_dtype_code(qx),
-        ox.data_ptr(),
-        oy.data_ptr(),
-        tensor_dtype_code(ox),
         seq_len,
         dim
     );
+}
 
-    return {ox, oy};
+void attention_backward2_launch_3d(
+    torch::Tensor& dqx,
+    torch::Tensor& dqy,
+    torch::Tensor& dkx,
+    torch::Tensor& dky,
+    torch::Tensor& dvx,
+    torch::Tensor& dvy,
+    const torch::Tensor& qx,
+    const torch::Tensor& qy,
+    const torch::Tensor& kx,
+    const torch::Tensor& ky,
+    const torch::Tensor& vx,
+    const torch::Tensor& vy,
+    const torch::Tensor& dox,
+    const torch::Tensor& doy
+) {
+    const auto batch = static_cast<int>(qx.size(0));
+    const auto seq_len = static_cast<int>(qx.size(1));
+    const auto dim = static_cast<int>(qx.size(2));
+    Qitnn_DeviceAttentionBackward2BatchedEx(
+        dqx.data_ptr(),
+        dqy.data_ptr(),
+        dkx.data_ptr(),
+        dky.data_ptr(),
+        dvx.data_ptr(),
+        dvy.data_ptr(),
+        tensor_dtype_code(dqx),
+        qx.data_ptr(),
+        qy.data_ptr(),
+        kx.data_ptr(),
+        ky.data_ptr(),
+        vx.data_ptr(),
+        vy.data_ptr(),
+        dox.data_ptr(),
+        doy.data_ptr(),
+        tensor_dtype_code(qx),
+        batch,
+        seq_len,
+        dim
+    );
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> attention_backward2_cuda(
@@ -270,14 +411,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     torch::Tensor vx,
     torch::Tensor vy
 ) {
-    check_cuda_amp_2d(dox, "dox");
-    check_cuda_amp_2d(doy, "doy");
-    check_cuda_amp_2d(qx, "qx");
-    check_cuda_amp_2d(qy, "qy");
-    check_cuda_amp_2d(kx, "kx");
-    check_cuda_amp_2d(ky, "ky");
-    check_cuda_amp_2d(vx, "vx");
-    check_cuda_amp_2d(vy, "vy");
+    check_cuda_amp_2d_or_3d(dox, "dox");
+    check_cuda_amp_2d_or_3d(doy, "doy");
+    check_cuda_amp_2d_or_3d(qx, "qx");
+    check_cuda_amp_2d_or_3d(qy, "qy");
+    check_cuda_amp_2d_or_3d(kx, "kx");
+    check_cuda_amp_2d_or_3d(ky, "ky");
+    check_cuda_amp_2d_or_3d(vx, "vx");
+    check_cuda_amp_2d_or_3d(vy, "vy");
 
     check_same_shape(dox, doy, "dox", "doy");
     check_same_shape(dox, qx, "dox", "qx");
@@ -303,9 +444,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     TORCH_CHECK(vx.get_device() == 0, "attention backward bridge currently supports only cuda:0");
     TORCH_CHECK(vy.get_device() == 0, "attention backward bridge currently supports only cuda:0");
 
-    const auto seq_len = static_cast<int>(qx.size(0));
-    const auto dim = static_cast<int>(qx.size(1));
-
     auto dqx = torch::empty_like(qx);
     auto dqy = torch::empty_like(qy);
     auto dkx = torch::empty_like(kx);
@@ -313,27 +451,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     auto dvx = torch::empty_like(vx);
     auto dvy = torch::empty_like(vy);
 
-    Qitnn_DeviceAttentionBackward2Ex(
-        dqx.data_ptr(),
-        dqy.data_ptr(),
-        dkx.data_ptr(),
-        dky.data_ptr(),
-        dvx.data_ptr(),
-        dvy.data_ptr(),
-        tensor_dtype_code(dqx),
-        qx.data_ptr(),
-        qy.data_ptr(),
-        kx.data_ptr(),
-        ky.data_ptr(),
-        vx.data_ptr(),
-        vy.data_ptr(),
-        dox.data_ptr(),
-        doy.data_ptr(),
-        tensor_dtype_code(qx),
-        seq_len,
-        dim
-    );
+    if (qx.dim() == 2) {
+        attention_backward2_launch_2d(dqx, dqy, dkx, dky, dvx, dvy, qx, qy, kx, ky, vx, vy, dox, doy);
+        return {dqx, dqy, dkx, dky, dvx, dvy};
+    }
 
+    attention_backward2_launch_3d(dqx, dqy, dkx, dky, dvx, dvy, qx, qy, kx, ky, vx, vy, dox, doy);
     return {dqx, dqy, dkx, dky, dvx, dvy};
 }
 

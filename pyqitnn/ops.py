@@ -192,20 +192,8 @@ class _Attention2Fn(torch.autograd.Function):
         qx, qy = _split_packed(q)
         kx, ky = _split_packed(k)
         vx, vy = _split_packed(v)
-
-        if q.dim() == 2:
-            ox, oy = ext.attention2_cuda(qx, qy, kx, ky, vx, vy)
-            out = _pack_paired(ox, oy)
-        else:
-            outs = []
-            for b in range(q.size(0)):
-                ox, oy = ext.attention2_cuda(
-                    qx[b].contiguous(), qy[b].contiguous(),
-                    kx[b].contiguous(), ky[b].contiguous(),
-                    vx[b].contiguous(), vy[b].contiguous(),
-                )
-                outs.append(_pack_paired(ox, oy))
-            out = torch.stack(outs, dim=0)
+        ox, oy = ext.attention2_cuda(qx, qy, kx, ky, vx, vy)
+        out = _pack_paired(ox, oy)
 
         ctx.save_for_backward(q, k, v)
         ctx.q_dtype = q.dtype
@@ -224,35 +212,12 @@ class _Attention2Fn(torch.autograd.Function):
         vx, vy = _split_packed(v)
         dox, doy = _split_packed(grad_out)
 
-        if q.dim() == 2:
-            dqx, dqy, dkx, dky, dvx, dvy = ext.attention_backward2_cuda(
-                dox, doy, qx, qy, kx, ky, vx, vy,
-            )
-            gq = _pack_paired(dqx, dqy)
-            gk = _pack_paired(dkx, dky)
-            gv = _pack_paired(dvx, dvy)
-            return (
-                gq,
-                gk,
-                gv,
-                None,
-            )
-
-        gq, gk, gv = [], [], []
-        for b in range(q.size(0)):
-            dqx, dqy, dkx, dky, dvx, dvy = ext.attention_backward2_cuda(
-                dox[b].contiguous(), doy[b].contiguous(),
-                qx[b].contiguous(), qy[b].contiguous(),
-                kx[b].contiguous(), ky[b].contiguous(),
-                vx[b].contiguous(), vy[b].contiguous(),
-            )
-            gq.append(_pack_paired(dqx, dqy))
-            gk.append(_pack_paired(dkx, dky))
-            gv.append(_pack_paired(dvx, dvy))
-
-        out_gq = torch.stack(gq, 0)
-        out_gk = torch.stack(gk, 0)
-        out_gv = torch.stack(gv, 0)
+        dqx, dqy, dkx, dky, dvx, dvy = ext.attention_backward2_cuda(
+            dox, doy, qx, qy, kx, ky, vx, vy,
+        )
+        out_gq = _pack_paired(dqx, dqy)
+        out_gk = _pack_paired(dkx, dky)
+        out_gv = _pack_paired(dvx, dvy)
         return out_gq, out_gk, out_gv, None
 
 

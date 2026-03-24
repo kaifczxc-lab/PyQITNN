@@ -20,7 +20,7 @@ PyQITNN exposes the following public symbols:
 |--------|------|-------------|
 | `forward3` | function | Born-rule ternary projection with autograd |
 | `centered_simplex` | function | Centered simplex transform with autograd |
-| `attention2` | function | 2D simplex-aware causal attention with autograd |
+| `attention2` | function | 2D/3D simplex-aware causal attention with autograd |
 | `prior_` | function | In-place entropy-floor prior on amplitude triplets |
 | `QITNNLinear` | nn.Module | Ternary Born-rule linear layer |
 | `QITNNSimplexTransformerLM` | nn.Module | Full transformer language model |
@@ -272,7 +272,7 @@ The result is packed back as `[ox | oy]`.
 **Batched mode:**
 
 When input is 3D `[B, S, D]`, attention is computed independently for each
-batch element. Internally this loops over the batch dimension.
+batch element through the native batched bridge/CUDA path.
 
 **Backward:**
 
@@ -857,6 +857,7 @@ cfg = TrainConfig(
     adamw_lr_end=3e-5,
     adamw_trit_floor_step=5e-5,
     lr_schedule="cosine",
+    warmup_steps=200,
     epochs=100,
     steps_per_epoch=1000,
     grad_clip=1.0,
@@ -956,7 +957,7 @@ and what happens when you change it.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `dataset` | str or Path | `r"D:\so_data\dataset.txt"` | Path to a file or directory with training data. If it's a file, that file is used directly. If it's a directory, all files inside are concatenated as raw bytes. When `extended_dataset=False` (default), the data is auto-split into train/val by `val_split_div`. |
+| `dataset` | str or Path | `r"YourPathToDataset"` | Path to a file or directory with training data. If it's a file, that file is used directly. If it's a directory, all files inside are concatenated as raw bytes. When `extended_dataset=False` (default), the data is auto-split into train/val by `val_split_div`. |
 | `extended_dataset` | bool | `False` | Data loading mode switch. `False` = simple mode: load `dataset`, auto-split into train/val. `True` = extended mode: use `train_dir`/`val_dir`/`test_dir` separately, no auto-split. |
 | `train_dir` | str, Path, or None | `None` | Path to training data (extended mode only). If None in extended mode, falls back to `dataset`. |
 | `val_dir` | str, Path, or None | `None` | Path to validation data (extended mode only). If None in extended mode, validation is skipped (empty tensor). |
@@ -1015,6 +1016,7 @@ and what happens when you change it.
 | `lr_start` | float | `0.005` | Starting LR for SGD. | Ignored when `optimizer="adamw"`. |
 | `lr_end` | float | `0.001` | Final LR for SGD. | Ignored when `optimizer="adamw"`. |
 | `lr_schedule` | str | `"cosine"` | LR decay curve. | `"cosine"` = half-cosine, slow start/end, fast middle. Better for longer runs. `"linear"` = straight line from start to end. Applies to both SGD and AdamW LR. |
+| `warmup_steps` | int | `0` | Linear LR warmup length in optimizer steps. | `0` preserves the legacy schedule exactly. `N > 0` ramps LR from `0` to the configured start LR over the first `N` optimizer steps, then the selected `lr_schedule` begins its normal decay toward the end LR. If `warmup_steps` exceeds the full run, the whole run becomes a clean ramp to the start LR. |
 
 #### AdamW settings
 
@@ -1179,6 +1181,7 @@ result = train(
     adamw_lr_end=3e-5,
     adamw_trit_floor_step=5e-5,
     lr_schedule="cosine",
+    warmup_steps=200,
     dim=384,
     ffn=768,
     seq_len=256,
@@ -1306,31 +1309,6 @@ For training, remember to:
 
 ---
 
-## Test suite
-
-The repo currently ships one main integration test script:
-
-**stress_test.py** -- stress and integration:
-- Born rule probability sum = 1.0
-- Simplex triangle vertex positions
-- attention2 vs PyTorch SDPA comparison
-- Prior entropy restoration
-- Full model gradient flow
-- Single-batch overfit
-- Checkpoint save/load roundtrip
-- Memory stability (100 iterations)
-- Determinism across runs
-- Residual connection verification
-
-Run tests:
-
-```bash
-cd torch_bridge
-python stress_test.py
-```
-
----
-
 ## Known limitations
 
 1. **Single device only.** All tensors must be on `cuda:0`. The extension
@@ -1365,8 +1343,9 @@ python stress_test.py
    with sequence length. For `seq_len > 256`, error may become noticeable. Does
    not affect training convergence in practice.
 
-9. **Batch loop in attention.** The 3D batched path for `attention2` loops over
-   the batch dimension in Python. Not fused into a single kernel launch. For
-   large batch sizes, per-sample overhead may be noticeable.
+9. **Attention kernel scope.** The 3D batched path for `attention2` is native
+   and batched, but it is still a custom causal kernel rather than a
+   FlashAttention-style fused implementation. Large `seq_len` still carries the
+   expected quadratic cost.
 
 ---

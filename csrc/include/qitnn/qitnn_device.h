@@ -124,6 +124,36 @@ QITNN_API void Qitnn_DeviceAttention2Ex(
     int dim
 );
 
+QITNN_API void Qitnn_DeviceAttention2Batched(
+    const float* d_qx,
+    const float* d_qy,
+    const float* d_kx,
+    const float* d_ky,
+    const float* d_vx,
+    const float* d_vy,
+    float* d_ox,
+    float* d_oy,
+    int batch,
+    int seq_len,
+    int dim
+);
+
+QITNN_API void Qitnn_DeviceAttention2BatchedEx(
+    const void* d_qx,
+    const void* d_qy,
+    const void* d_kx,
+    const void* d_ky,
+    const void* d_vx,
+    const void* d_vy,
+    int dtype,
+    void* d_ox,
+    void* d_oy,
+    int out_dtype,
+    int batch,
+    int seq_len,
+    int dim
+);
+
 QITNN_API void Qitnn_DeviceAttentionBackward2(
     float* d_dqx,
     float* d_dqy,
@@ -139,6 +169,26 @@ QITNN_API void Qitnn_DeviceAttentionBackward2(
     const float* d_vy,
     const float* d_dox,
     const float* d_doy,
+    int seq_len,
+    int dim
+);
+
+QITNN_API void Qitnn_DeviceAttentionBackward2Batched(
+    float* d_dqx,
+    float* d_dqy,
+    float* d_dkx,
+    float* d_dky,
+    float* d_dvx,
+    float* d_dvy,
+    const float* d_qx,
+    const float* d_qy,
+    const float* d_kx,
+    const float* d_ky,
+    const float* d_vx,
+    const float* d_vy,
+    const float* d_dox,
+    const float* d_doy,
+    int batch,
     int seq_len,
     int dim
 );
@@ -160,6 +210,28 @@ QITNN_API void Qitnn_DeviceAttentionBackward2Ex(
     const void* d_dox,
     const void* d_doy,
     int in_dtype,
+    int seq_len,
+    int dim
+);
+
+QITNN_API void Qitnn_DeviceAttentionBackward2BatchedEx(
+    void* d_dqx,
+    void* d_dqy,
+    void* d_dkx,
+    void* d_dky,
+    void* d_dvx,
+    void* d_dvy,
+    int out_dtype,
+    const void* d_qx,
+    const void* d_qy,
+    const void* d_kx,
+    const void* d_ky,
+    const void* d_vx,
+    const void* d_vy,
+    const void* d_dox,
+    const void* d_doy,
+    int in_dtype,
+    int batch,
     int seq_len,
     int dim
 );
