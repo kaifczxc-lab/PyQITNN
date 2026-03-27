@@ -15,6 +15,7 @@ from pathlib import Path
 import importlib.util
 import torch
 ROOT = Path(__file__).resolve().parent
+_TRAINER_DEFAULT_PRECISION_MODE = "qts_fp32_rest_bf16"
 
 
 def _pick_pyqitnn_import_root() -> str | None:
@@ -43,6 +44,14 @@ _pyqitnn_root = _pick_pyqitnn_import_root()
 if _pyqitnn_root is not None:
     sys.path.insert(0, _pyqitnn_root)
 import pyqitnn
+from pyqitnn.diagnostics import QITNN_DIAG_CSV_HEADER
+from pyqitnn.diagnostics import QITNN_DIAG_SCHEMA_VERSION
+from pyqitnn.diagnostics import QITNN_DIAG_STAT_KEYS
+from pyqitnn.diagnostics import format_qitnn_diag_snapshot
+from pyqitnn.diagnostics import iter_qitnn_diag_csv_rows
+from pyqitnn.precision import normalize_precision_mode as _shared_normalize_precision_mode
+from pyqitnn.precision import precision_mode_choices as _precision_mode_choices
+from pyqitnn.precision import resolve_precision_mode as _shared_resolve_precision_mode
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
 #====================
@@ -55,12 +64,12 @@ class TrainConfig:
     # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
     #====================
-    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
+    dataset: str | Path = r"Your_path_to_dataset"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
     test_dir: str | Path | None = None
-    max_bytes: int = 10_000_000       # max bytes to load per data source
+    max_bytes: int = 3_000_000       # max bytes to load per data source
     data_format: str = "auto"         # "auto", "text", "json", "jsonl"
     json_text_fields: str | None = None   # comma-separated preferred text fields, e.g. "text,content"
     tokenizer: str = "bpe"           # "byte" or "bpe"
@@ -71,8 +80,8 @@ class TrainConfig:
     #====================
     # model
     #====================
-    dim: int = 64
-    ffn: int = 128
+    dim: int = 256
+    ffn: int = 512
     layers: int = 2
     seq_len: int = 256
 
@@ -82,12 +91,13 @@ class TrainConfig:
     device: str = "cuda:0"
     seed: int = 7
     batch_size: int = 4
+    grad_accum_steps: int = 1      # micro-batches per optimizer step; 1 keeps the legacy trainer contract
     steps: int | None = None         # if set, overrides epochs/steps_per_epoch
     epochs: int = 20
     steps_per_epoch: int = 2000
     grad_clip: float = 1.0
-    mixed_precision: bool | None = None   # legacy compatibility knob
-    precision_mode: str | None = "qts_fp32_rest_bf16"    # None = resolve from mixed_precision or default fp32
+    mixed_precision: bool | None = None   # legacy compatibility knob for older trainer calls
+    precision_mode: str | None = None     # canonical precision selector; None resolves to trainer default
     #====================
     # optimizer
     # "adamw" and "SGD"
@@ -159,8 +169,8 @@ class TrainConfig:
     #====================
     # logging
     #====================
-    log_every: int = 100             # print loss every N steps
-    diag_every: int = 10             # full QTS diagnostics every N epochs
+    log_every: int = 500             # print loss every N steps
+    diag_every: int = 5             # full QTS diagnostics every N epochs
     csv_log: str | None = None       # None = auto-create in run directory
     #====================
     # saving
@@ -180,34 +190,34 @@ class TrainConfig:
     no_interactive: bool = False     # force non-interactive
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-_PRECISION_MODE_ALIASES = {
-    "mixed_bf16_native": "qts_fp32_rest_bf16",
-    "bf16": "qts_fp32_rest_bf16",
-}
-_PRECISION_MODE_SET = {"fp32", "qts_fp32_rest_bf16"}
-
-
 def _normalize_precision_mode(value: str) -> str:
-    mode = value.strip().lower()
-    mode = _PRECISION_MODE_ALIASES.get(mode, mode)
-    if mode not in _PRECISION_MODE_SET:
-        wanted = ", ".join(sorted(_PRECISION_MODE_SET))
-        raise RuntimeError(f"precision_mode must be one of: {wanted}")
-    return mode
+    return _shared_normalize_precision_mode(value)
 
 
 def _resolve_precision_mode_cfg(cfg: TrainConfig) -> tuple[str, bool]:
-    mode = "fp32" if cfg.precision_mode is None else _normalize_precision_mode(str(cfg.precision_mode))
-    if cfg.mixed_precision is not None:
-        legacy_mode = "qts_fp32_rest_bf16" if bool(cfg.mixed_precision) else "fp32"
-        if cfg.precision_mode is None:
-            mode = legacy_mode
-        elif legacy_mode != mode:
-            raise RuntimeError(
-                "mixed_precision and precision_mode conflict. "
-                "Use precision_mode alone, or keep them aligned during migration."
-            )
-    return mode, mode != "fp32"
+    return _shared_resolve_precision_mode(
+        cfg.precision_mode,
+        cfg.mixed_precision,
+        default_mode=_TRAINER_DEFAULT_PRECISION_MODE,
+    )
+
+
+def _resolve_grad_accum_steps(value: int | None) -> int:
+    grad_accum_steps = 1 if value is None else int(value)
+    if grad_accum_steps < 1:
+        raise RuntimeError("grad_accum_steps must be >= 1")
+    return grad_accum_steps
+
+
+def _resolve_train_step_plan(cfg: TrainConfig) -> tuple[int, int, int, int]:
+    epochs = int(cfg.epochs)
+    steps_per_ep = int(cfg.steps_per_epoch)
+    if cfg.steps is not None:
+        epochs = 1
+        steps_per_ep = int(cfg.steps)
+    total_steps = max(epochs * steps_per_ep, 1)
+    grad_accum_steps = _resolve_grad_accum_steps(cfg.grad_accum_steps)
+    return epochs, steps_per_ep, total_steps, grad_accum_steps
 
 #====================
 # data loading
@@ -700,25 +710,73 @@ def fmt_metric(value: float | None, digits: int = 6) -> str:
         return "inf"
     return f"{value:.{digits}f}"
 #====================
+# rng helpers
+#====================
+def _capture_rng_state() -> dict[str, object]:
+    state: dict[str, object] = {
+        "torch_cpu": torch.get_rng_state().detach().cpu().clone(),
+    }
+    if torch.cuda.is_available():
+        state["torch_cuda"] = [
+            s.detach().cpu().clone()
+            for s in torch.cuda.get_rng_state_all()
+        ]
+    return state
+
+
+def _restore_rng_state(state: dict[str, object] | None) -> bool:
+    if not state:
+        return False
+
+    restored = False
+    cpu_state = state.get("torch_cpu")
+    if cpu_state is not None:
+        torch.set_rng_state(torch.as_tensor(cpu_state, dtype=torch.uint8, device="cpu"))
+        restored = True
+
+    cuda_states = state.get("torch_cuda")
+    if cuda_states is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("checkpoint contains CUDA RNG state but CUDA is not available")
+        cuda_state_list = list(cuda_states)
+        if len(cuda_state_list) > torch.cuda.device_count():
+            raise RuntimeError(
+                "checkpoint contains CUDA RNG state for more devices than are currently available"
+            )
+        for idx, cuda_state in enumerate(cuda_state_list):
+            torch.cuda.set_rng_state(
+                torch.as_tensor(cuda_state, dtype=torch.uint8, device="cpu"),
+                device=idx,
+            )
+        restored = True
+
+    return restored
+#====================
 # checkpoints
 #====================
 def save_ckpt(path: Path, model, opt, epoch: int, step: int, best_val,
-              *, model_only: bool = False):
+              *, best_val_epoch: int = 0, model_only: bool = False):
     path.parent.mkdir(parents=True, exist_ok=True)
     payload: dict = {
         "model": model.state_dict(),
         "epoch": epoch,
         "global_step": step,
         "best_val_loss": best_val,
+        "best_val_epoch": int(best_val_epoch),
+        "rng_state": _capture_rng_state(),
     }
     if not model_only:
         payload["optimizer"] = opt.state_dict()
     torch.save(payload, str(path))
-def load_ckpt(path: Path, model, opt, device):
+
+
+def load_ckpt(path: Path, model, opt, device, *, restore_rng: bool = True):
     ckpt = torch.load(str(path), map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     if opt is not None and "optimizer" in ckpt:
         opt.load_state_dict(ckpt["optimizer"])
+    if restore_rng:
+        _restore_rng_state(ckpt.get("rng_state"))
     return ckpt
 #====================
 # csv logger
@@ -783,6 +841,220 @@ class CsvLog:
     def close(self):
         if self._file is not None:
             self._file.close()
+            self._file = None
+            self._writer = None
+
+
+class QitnnDiagLog:
+    def __init__(self, json_path: str | None, csv_path: str | None, *, start_epoch: int = 1):
+        self._json_path = Path(json_path) if json_path is not None else None
+        self._csv_path = Path(csv_path) if csv_path is not None else None
+        self._csv_file = None
+        self._csv_writer = None
+        self._snapshots: list[dict[str, object]] = []
+        self._start_epoch = int(start_epoch)
+
+        if self._json_path is not None:
+            self._json_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._json_path.exists() and self._json_path.stat().st_size > 0:
+                payload = json.loads(self._json_path.read_text(encoding="utf-8"))
+                epochs = payload.get("epochs", [])
+                if isinstance(epochs, list):
+                    self._snapshots = self._filter_snapshots_before_epoch(epochs)
+                    self._write_json_payload()
+
+        if self._csv_path is None:
+            return
+        p = self._csv_path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > 0:
+            kept_rows = self._read_csv_rows_before_epoch(p)
+            with open(p, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(QITNN_DIAG_CSV_HEADER)
+                writer.writerows(kept_rows)
+        need_header = not p.exists() or p.stat().st_size == 0
+        self._csv_file = open(p, "a", newline="", encoding="utf-8")
+        self._csv_writer = csv.writer(self._csv_file)
+        if need_header:
+            self._csv_writer.writerow(QITNN_DIAG_CSV_HEADER)
+
+    def _filter_snapshots_before_epoch(self, snapshots: list[object]) -> list[dict[str, object]]:
+        kept: list[dict[str, object]] = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            epoch = snapshot.get("epoch")
+            if epoch is None:
+                continue
+            try:
+                epoch_int = int(epoch)
+            except (TypeError, ValueError):
+                continue
+            if epoch_int < self._start_epoch:
+                kept.append(snapshot)
+        return kept
+
+    def _read_csv_rows_before_epoch(self, path: Path) -> list[list[str]]:
+        kept_rows: list[list[str]] = []
+        with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    epoch_int = int(row.get("epoch", ""))
+                except (TypeError, ValueError):
+                    continue
+                if epoch_int < self._start_epoch:
+                    kept_rows.append([row.get(col, "") for col in QITNN_DIAG_CSV_HEADER])
+        return kept_rows
+
+    def _write_json_payload(self):
+        if self._json_path is None:
+            return
+        json_payload = {
+            "kind": "qitnn_layer_diagnostics",
+            "schema_version": QITNN_DIAG_SCHEMA_VERSION,
+            "stats_keys": list(QITNN_DIAG_STAT_KEYS),
+            "csv_header": list(QITNN_DIAG_CSV_HEADER),
+            "epochs": self._snapshots,
+        }
+        self._json_path.write_text(
+            json.dumps(json_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def snapshot(self, payload: dict[str, object]):
+        if self._json_path is not None:
+            self._snapshots.append(payload)
+            self._write_json_payload()
+        if self._csv_writer is None:
+            return
+        for row in iter_qitnn_diag_csv_rows(payload):
+            self._csv_writer.writerow(row)
+        self._csv_file.flush()
+
+    def close(self):
+        if self._csv_file is not None:
+            self._csv_file.close()
+            self._csv_file = None
+            self._csv_writer = None
+
+
+def _build_cli_parser() -> argparse.ArgumentParser:
+    D = TrainConfig()
+    modes = ", ".join(_precision_mode_choices())
+    p = argparse.ArgumentParser(description="pyqitnn transformer training")
+    # data
+    p.add_argument("--dataset",           type=str,   default=D.dataset)
+    p.add_argument("--extended-dataset",  action="store_true")
+    p.add_argument("--train-dir",         type=str,   default=None)
+    p.add_argument("--val-dir",           type=str,   default=None)
+    p.add_argument("--test-dir",          type=str,   default=None)
+    p.add_argument("--max-bytes",         type=int,   default=D.max_bytes)
+    p.add_argument("--data-format",       type=str,   default=D.data_format, choices=("auto", "text", "json", "jsonl"))
+    p.add_argument("--json-text-fields",  type=str,   default=D.json_text_fields)
+    p.add_argument("--tokenizer",         type=str,   default=D.tokenizer, choices=("byte", "bpe"))
+    p.add_argument("--tokenizer-path",    type=str,   default=None)
+    p.add_argument("--tokenizer-vocab-size", type=int, default=D.tokenizer_vocab_size)
+    p.add_argument("--tokenizer-min-frequency", type=int, default=D.tokenizer_min_frequency)
+    # model
+    p.add_argument("--dim",          type=int,   default=D.dim)
+    p.add_argument("--ffn",          type=int,   default=D.ffn)
+    p.add_argument("--layers",       type=int,   default=D.layers)
+    p.add_argument("--seq-len",      type=int,   default=D.seq_len)
+    # training
+    p.add_argument("--device",           type=str,   default=D.device)
+    p.add_argument("--seed",             type=int,   default=D.seed)
+    p.add_argument("--batch-size",       type=int,   default=D.batch_size)
+    p.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=D.grad_accum_steps,
+        help=(
+            "Gradient accumulation micro-batches per optimizer step. "
+            "Use 1 to keep the legacy trainer contract exactly."
+        ),
+    )
+    p.add_argument("--steps",            type=int,   default=None)
+    p.add_argument("--epochs",           type=int,   default=D.epochs)
+    p.add_argument("--steps-per-epoch",  type=int,   default=D.steps_per_epoch)
+    p.add_argument("--grad-clip",        type=float, default=D.grad_clip)
+    p.add_argument(
+        "--precision-mode",
+        type=str,
+        default=D.precision_mode,
+        help=(
+            "Canonical precision selector. "
+            f"Supported modes: {modes}. "
+            f"When omitted, the standalone trainer defaults to '{_TRAINER_DEFAULT_PRECISION_MODE}'."
+        ),
+    )
+    p.add_argument("--mixed-precision", dest="mixed_precision", action="store_true", default=D.mixed_precision, help=argparse.SUPPRESS)
+    p.add_argument("--no-mixed-precision", dest="mixed_precision", action="store_false", help=argparse.SUPPRESS)
+    # optimizer
+    p.add_argument("--optimizer",    type=str,   default=D.optimizer, choices=("sgd", "adamw"))
+    p.add_argument("--lr-start",     type=float, default=D.lr_start)
+    p.add_argument("--lr-end",       type=float, default=D.lr_end)
+    p.add_argument("--lr-schedule",  type=str,   default=D.lr_schedule, choices=("linear", "cosine"))
+    p.add_argument("--warmup-steps", type=int,   default=D.warmup_steps)
+    # zero-boost
+    p.add_argument("--zero-boost",      type=float, default=D.zero_boost)
+    p.add_argument("--zero-boost-qk",   type=float, default=None)
+    p.add_argument("--zero-boost-vo",   type=float, default=None)
+    p.add_argument("--zero-boost-ff",   type=float, default=None)
+    # adamw
+    p.add_argument("--adamw-lr-start",         type=float, default=D.adamw_lr_start)
+    p.add_argument("--adamw-lr-end",           type=float, default=D.adamw_lr_end)
+    p.add_argument("--adamw-beta1",            type=float, default=D.adamw_beta1)
+    p.add_argument("--adamw-beta2",            type=float, default=D.adamw_beta2)
+    p.add_argument("--adamw-eps",              type=float, default=D.adamw_eps)
+    p.add_argument("--adamw-weight-decay",     type=float, default=D.adamw_weight_decay)
+    p.add_argument("--adamw-trit-floor-step",     type=float, default=D.adamw_trit_floor_step)
+    p.add_argument("--adamw-trit-floor-step-qk",  type=float, default=D.adamw_trit_floor_step_qk)
+    p.add_argument("--adamw-trit-floor-step-vo",  type=float, default=D.adamw_trit_floor_step_vo)
+    p.add_argument("--adamw-trit-floor-step-ff",  type=float, default=D.adamw_trit_floor_step_ff)
+    # trit-floor
+    p.add_argument("--trit-floor-h",              type=float, default=D.trit_floor_h)
+    p.add_argument("--trit-floor-mul-start",      type=float, default=D.trit_floor_mul_start)
+    p.add_argument("--trit-floor-mul-end",        type=float, default=D.trit_floor_mul_end)
+    p.add_argument("--trit-floor-mul-qk-start",   type=float, default=None)
+    p.add_argument("--trit-floor-mul-qk-end",     type=float, default=None)
+    p.add_argument("--trit-floor-mul-vo-start",   type=float, default=None)
+    p.add_argument("--trit-floor-mul-vo-end",     type=float, default=None)
+    p.add_argument("--trit-floor-mul-ff-start",   type=float, default=None)
+    p.add_argument("--trit-floor-mul-ff-end",     type=float, default=None)
+    # entropy
+    p.add_argument("--ent-lambda",      type=float, default=D.ent_lambda)
+    p.add_argument("--ent-lambda-qk",   type=float, default=None)
+    p.add_argument("--ent-lambda-vo",   type=float, default=None)
+    p.add_argument("--ent-lambda-ff",   type=float, default=None)
+    # validation
+    p.add_argument("--val-split-div",   type=int, default=D.val_split_div)
+    p.add_argument("--val-steps",       type=int, default=D.val_steps)
+    # generation
+    p.add_argument("--temperature",     type=float, default=D.temperature)
+    p.add_argument("--top-k",           type=int,   default=D.top_k)
+    p.add_argument("--gen-bytes",       type=int,   default=D.gen_bytes)
+    p.add_argument("--gen-tokens",      type=int,   default=None)
+    p.add_argument("--prompt",          type=str,   default=D.prompt)
+    p.add_argument("--prompt-bytes",    type=int,   default=D.prompt_bytes)
+    p.add_argument("--prompt-tokens",   type=int,   default=None)
+    p.add_argument("--gen-every",       type=int,   default=D.gen_every)
+    # logging
+    p.add_argument("--log-every",       type=int, default=D.log_every)
+    p.add_argument("--diag-every",      type=int, default=D.diag_every)
+    p.add_argument("--csv-log",         type=str, default=None)
+    # saving
+    p.add_argument("--save-dir",        type=str, default=D.save_dir)
+    p.add_argument("--run-name",        type=str, default=None)
+    p.add_argument("--no-save",         action="store_true")
+    p.add_argument("--save-every",      type=int, default=D.save_every)
+    p.add_argument("--save-model-only", action="store_true")
+    p.add_argument("--resume",          type=str, default=None)
+    # interactive
+    p.add_argument("--interactive",     action="store_true")
+    p.add_argument("--no-interactive",  action="store_true")
+    return p
 #-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
 #====================
@@ -808,6 +1080,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             setattr(cfg, k, v)
 
     precision_mode, use_mixed_precision = _resolve_precision_mode_cfg(cfg)
+    epochs, steps_per_ep, total_steps, grad_accum_steps = _resolve_train_step_plan(cfg)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA required")
@@ -851,12 +1124,6 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     else:
         interactive = sys.stdin.isatty()
 
-    epochs = cfg.epochs
-    steps_per_ep = cfg.steps_per_epoch
-    if cfg.steps is not None:
-        epochs = 1
-        steps_per_ep = cfg.steps
-    total_steps = max(epochs * steps_per_ep, 1)
     #====================
     # data
     #====================
@@ -998,6 +1265,8 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         start_ep = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
         best_val = ckpt.get("best_val_loss", None)
+        best_val_ep_raw = ckpt.get("best_val_epoch", 0)
+        best_val_ep = 0 if best_val_ep_raw is None else int(best_val_ep_raw)
         best_ckpt_path = infer_best_ckpt_path(cfg.resume)
         if best_ckpt_path is not None:
             best_state_cpu = load_checkpoint_model_state_cpu(best_ckpt_path)
@@ -1012,15 +1281,28 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         run_dir = Path(cfg.save_dir) / run_name
         run_dir.mkdir(parents=True, exist_ok=True)
         tokenizer_asset = tokenizer.save(run_dir / "tokenizer.json")
+        diag_json_path = run_dir / "diagnostics.json"
+        diag_csv_path = run_dir / "diagnostics_layers.csv"
         config_dict = {k: str(v) if isinstance(v, Path) else v
                        for k, v in asdict(cfg).items()}
         config_dict["run_dir"] = str(run_dir)
         config_dict["params"] = n_params
+        config_dict["grad_accum_steps"] = grad_accum_steps
+        config_dict["optimizer_steps_per_epoch"] = steps_per_ep
+        config_dict["optimizer_total_steps"] = total_steps
+        config_dict["precision_mode_requested"] = config_dict.get("precision_mode")
+        config_dict["precision_mode"] = precision_mode
         config_dict["precision_mode_resolved"] = precision_mode
+        config_dict["legacy_mixed_precision_input"] = cfg.mixed_precision
         config_dict["tokenizer_summary"] = tokenizer.summary()
         config_dict["tokenizer_asset"] = str(tokenizer_asset)
+        config_dict["diagnostics_json"] = str(diag_json_path)
+        config_dict["diagnostics_csv"] = str(diag_csv_path)
         (run_dir / "config.json").write_text(
             json.dumps(config_dict, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        diag_json_path = None
+        diag_csv_path = None
     #====================
     # csv log
     #====================
@@ -1028,6 +1310,11 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     if csv_path is None and run_dir is not None:
         csv_path = str(run_dir / "metrics.csv")
     log = CsvLog(csv_path if saving else None)
+    diag_log = QitnnDiagLog(
+        str(diag_json_path) if diag_json_path is not None else None,
+        str(diag_csv_path) if diag_csv_path is not None else None,
+        start_epoch=start_ep,
+    )
     #====================
     # print config
     #====================
@@ -1040,6 +1327,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         print(f"test_tokens   {test_data.numel()}")
     print(f"params        {n_params:,}")
     print(f"optimizer     {cfg.optimizer}")
+    print(f"grad_accum    {grad_accum_steps}")
     print(f"mixed_prec    {use_mixed_precision}")
     print(f"precision_mode {precision_mode}")
     print(f"lr            {lr_start} -> {lr_end}  ({cfg.lr_schedule})")
@@ -1076,6 +1364,8 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         ep_total_nll_nats = 0.0
         t0 = time.time()
         for step in range(1, steps_per_ep + 1):
+            # global_step is the optimizer-step cursor across resume.
+            # Micro-steps remain transient and never cross checkpoint boundaries.
             global_step += 1
             step_idx = global_step - 1
             frac = _schedule_progress(step_idx, total_steps, warmup_steps)
@@ -1092,10 +1382,20 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             fm_ff  = sched(fm_ff_s, fm_ff_e, frac)
             for g in opt.param_groups:
                 g["lr"] = lr_now * float(g.get("lr_scale", 1.0))
-            x, y = sample_batch(train_data, cfg.batch_size, cfg.seq_len, device)
             opt.zero_grad(set_to_none=True)
-            _, loss = model(x, targets=y)
-            loss.backward()
+            step_total_nll_nats = 0.0
+            step_tokens = 0
+            step_target_bytes = 0
+            for _ in range(grad_accum_steps):
+                x, y = sample_batch(train_data, cfg.batch_size, cfg.seq_len, device)
+                _, loss = model(x, targets=y)
+                (loss / float(grad_accum_steps)).backward()
+                micro_loss = float(loss.detach().cpu())
+                micro_tokens = int(y.numel())
+                micro_target_bytes = _count_token_bytes(y, tokenizer, tok_bytes_lut)
+                step_total_nll_nats += micro_loss * float(micro_tokens)
+                step_tokens += micro_tokens
+                step_target_bytes += micro_target_bytes
             if cfg.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             opt.step()
@@ -1114,21 +1414,21 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
                 step_ff=ps_ff,
                 entropy_floor=cfg.trit_floor_h,
             )
-            train_loss = float(loss.detach().cpu())
+            # Step-level metrics must reflect the full accumulated optimizer step,
+            # not the scaled backward loss used inside each micro-step.
+            step_loss, step_bpb = summarize_nll_metrics(step_total_nll_nats, step_tokens, step_target_bytes)
+            if step_loss is None:
+                step_loss = 0.0
             if first_loss is None:
-                first_loss = train_loss
-            last_loss = train_loss
-            batch_tokens = int(y.numel())
-            batch_target_bytes = _count_token_bytes(y, tokenizer, tok_bytes_lut)
-            batch_total_nll_nats = train_loss * float(batch_tokens)
-            batch_bpb = total_nll_to_bpb(batch_total_nll_nats, batch_target_bytes)
+                first_loss = step_loss
+            last_loss = step_loss
             if first_bpb is None:
-                first_bpb = batch_bpb
-            last_bpb = batch_bpb
-            ep_total_nll_nats += batch_total_nll_nats
+                first_bpb = step_bpb
+            last_bpb = step_bpb
+            ep_total_nll_nats += step_total_nll_nats
             ep_n += 1
-            ep_tokens += batch_tokens
-            ep_target_bytes += batch_target_bytes
+            ep_tokens += step_tokens
+            ep_target_bytes += step_target_bytes
             if step % cfg.log_every == 0 or step == steps_per_ep:
                 run_train_loss, run_train_bpb = summarize_nll_metrics(ep_total_nll_nats, ep_tokens, ep_target_bytes)
                 if run_train_loss is None:
@@ -1206,8 +1506,10 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             f"(ppl={fmt_metric(best_val_ppl, 4)})  "
             f"time={ep_time:.1f}s"
         )
-        for line in model.format_qitnn_diagnostics(epoch=ep, full=(ep % cfg.diag_every == 0)):
+        diag_snapshot = model.collect_qitnn_diagnostics(epoch=ep, full=(ep % cfg.diag_every == 0))
+        for line in format_qitnn_diag_snapshot(diag_snapshot):
             print(line)
+        diag_log.snapshot(diag_snapshot)
         log.row(
             ep,
             avg_train,
@@ -1221,15 +1523,19 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
             train_bpb=train_bpb,
             val_bpb=val_bpb,
         )
+        # Checkpoints are emitted only after completed optimizer steps.
+        # No partial accumulation state is serialized or restored.
         # save best checkpoint
         if run_dir is not None and new_best:
             save_ckpt(run_dir / "ckpt_best.pt", model, opt, ep, global_step, best_val,
+                      best_val_epoch=best_val_ep,
                       model_only=cfg.save_model_only)
             print(f"  saved best -> {run_dir / 'ckpt_best.pt'}")
         # periodic checkpoint
         if run_dir is not None and cfg.save_every > 0 and ep % cfg.save_every == 0:
             ckpt_path = run_dir / f"ckpt_ep{ep}.pt"
             save_ckpt(ckpt_path, model, opt, ep, global_step, best_val,
+                      best_val_epoch=best_val_ep,
                       model_only=cfg.save_model_only)
             print(f"  saved {ckpt_path}")
         # mid-training generation
@@ -1249,6 +1555,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     #====================
     if run_dir is not None:
         save_ckpt(run_dir / "ckpt_final.pt", model, opt, epochs, global_step, best_val,
+                  best_val_epoch=best_val_ep,
                   model_only=cfg.save_model_only)
         print(f"saved final -> {run_dir / 'ckpt_final.pt'}")
     #====================
@@ -1307,6 +1614,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     test_bpb = final_test_bpb
     test_ppl = final_test_ppl
     log.close()
+    diag_log.close()
     print("first_loss", first_loss)
     print("first_bpb", first_bpb)
     print("last_loss", last_loss)
@@ -1383,8 +1691,13 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
         "last_epoch_train_tok_s": last_epoch_train_tok_s,
         "last_epoch_val_tok_s": last_epoch_val_tok_s,
         "run_dir": str(run_dir) if run_dir else None,
+        "diagnostics_json": str(diag_json_path) if diag_json_path is not None else None,
+        "diagnostics_csv": str(diag_csv_path) if diag_csv_path is not None else None,
         "precision_mode": precision_mode,
         "mixed_precision": use_mixed_precision,
+        "grad_accum_steps": grad_accum_steps,
+        "optimizer_steps_per_epoch": steps_per_ep,
+        "optimizer_total_steps": total_steps,
         "model": model,
         "tokenizer": tokenizer,
     }
@@ -1394,107 +1707,9 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
 # CLI
 #====================
 def _parse_cli(args: list[str] | None = None) -> TrainConfig:
-    D = TrainConfig()
     arg_list = sys.argv[1:] if args is None else list(args)
-    p = argparse.ArgumentParser(description="pyqitnn transformer training")
-    # data
-    p.add_argument("--dataset",           type=str,   default=D.dataset)
-    p.add_argument("--extended-dataset",  action="store_true")
-    p.add_argument("--train-dir",         type=str,   default=None)
-    p.add_argument("--val-dir",           type=str,   default=None)
-    p.add_argument("--test-dir",          type=str,   default=None)
-    p.add_argument("--max-bytes",         type=int,   default=D.max_bytes)
-    p.add_argument("--data-format",       type=str,   default=D.data_format, choices=("auto", "text", "json", "jsonl"))
-    p.add_argument("--json-text-fields",  type=str,   default=D.json_text_fields)
-    p.add_argument("--tokenizer",         type=str,   default=D.tokenizer, choices=("byte", "bpe"))
-    p.add_argument("--tokenizer-path",    type=str,   default=None)
-    p.add_argument("--tokenizer-vocab-size", type=int, default=D.tokenizer_vocab_size)
-    p.add_argument("--tokenizer-min-frequency", type=int, default=D.tokenizer_min_frequency)
-    # model
-    p.add_argument("--dim",          type=int,   default=D.dim)
-    p.add_argument("--ffn",          type=int,   default=D.ffn)
-    p.add_argument("--layers",       type=int,   default=D.layers)
-    p.add_argument("--seq-len",      type=int,   default=D.seq_len)
-    # training
-    p.add_argument("--device",           type=str,   default=D.device)
-    p.add_argument("--seed",             type=int,   default=D.seed)
-    p.add_argument("--batch-size",       type=int,   default=D.batch_size)
-    p.add_argument("--steps",            type=int,   default=None)
-    p.add_argument("--epochs",           type=int,   default=D.epochs)
-    p.add_argument("--steps-per-epoch",  type=int,   default=D.steps_per_epoch)
-    p.add_argument("--grad-clip",        type=float, default=D.grad_clip)
-    p.add_argument("--precision-mode",   type=str,   default=D.precision_mode)
-    p.add_argument("--mixed-precision",     dest="mixed_precision", action="store_true",  default=D.mixed_precision)
-    p.add_argument("--no-mixed-precision",  dest="mixed_precision", action="store_false")
-    # optimizer
-    p.add_argument("--optimizer",    type=str,   default=D.optimizer, choices=("sgd", "adamw"))
-    p.add_argument("--lr-start",     type=float, default=D.lr_start)
-    p.add_argument("--lr-end",       type=float, default=D.lr_end)
-    p.add_argument("--lr-schedule",  type=str,   default=D.lr_schedule, choices=("linear", "cosine"))
-    p.add_argument("--warmup-steps", type=int,   default=D.warmup_steps)
-    # zero-boost
-    p.add_argument("--zero-boost",      type=float, default=D.zero_boost)
-    p.add_argument("--zero-boost-qk",   type=float, default=None)
-    p.add_argument("--zero-boost-vo",   type=float, default=None)
-    p.add_argument("--zero-boost-ff",   type=float, default=None)
-    # adamw
-    p.add_argument("--adamw-lr-start",         type=float, default=D.adamw_lr_start)
-    p.add_argument("--adamw-lr-end",           type=float, default=D.adamw_lr_end)
-    p.add_argument("--adamw-beta1",            type=float, default=D.adamw_beta1)
-    p.add_argument("--adamw-beta2",            type=float, default=D.adamw_beta2)
-    p.add_argument("--adamw-eps",              type=float, default=D.adamw_eps)
-    p.add_argument("--adamw-weight-decay",     type=float, default=D.adamw_weight_decay)
-    p.add_argument("--adamw-trit-floor-step",     type=float, default=D.adamw_trit_floor_step)
-    p.add_argument("--adamw-trit-floor-step-qk",  type=float, default=D.adamw_trit_floor_step_qk)
-    p.add_argument("--adamw-trit-floor-step-vo",  type=float, default=D.adamw_trit_floor_step_vo)
-    p.add_argument("--adamw-trit-floor-step-ff",  type=float, default=D.adamw_trit_floor_step_ff)
-    # trit-floor
-    p.add_argument("--trit-floor-h",              type=float, default=D.trit_floor_h)
-    p.add_argument("--trit-floor-mul-start",      type=float, default=D.trit_floor_mul_start)
-    p.add_argument("--trit-floor-mul-end",        type=float, default=D.trit_floor_mul_end)
-    p.add_argument("--trit-floor-mul-qk-start",   type=float, default=None)
-    p.add_argument("--trit-floor-mul-qk-end",     type=float, default=None)
-    p.add_argument("--trit-floor-mul-vo-start",   type=float, default=None)
-    p.add_argument("--trit-floor-mul-vo-end",     type=float, default=None)
-    p.add_argument("--trit-floor-mul-ff-start",   type=float, default=None)
-    p.add_argument("--trit-floor-mul-ff-end",     type=float, default=None)
-    # entropy
-    p.add_argument("--ent-lambda",      type=float, default=D.ent_lambda)
-    p.add_argument("--ent-lambda-qk",   type=float, default=None)
-    p.add_argument("--ent-lambda-vo",   type=float, default=None)
-    p.add_argument("--ent-lambda-ff",   type=float, default=None)
-    # validation
-    p.add_argument("--val-split-div",   type=int, default=D.val_split_div)
-    p.add_argument("--val-steps",       type=int, default=D.val_steps)
-    # generation
-    p.add_argument("--temperature",     type=float, default=D.temperature)
-    p.add_argument("--top-k",           type=int,   default=D.top_k)
-    p.add_argument("--gen-bytes",       type=int,   default=D.gen_bytes)
-    p.add_argument("--gen-tokens",      type=int,   default=None)
-    p.add_argument("--prompt",          type=str,   default=D.prompt)
-    p.add_argument("--prompt-bytes",    type=int,   default=D.prompt_bytes)
-    p.add_argument("--prompt-tokens",   type=int,   default=None)
-    p.add_argument("--gen-every",       type=int,   default=D.gen_every)
-    # logging
-    p.add_argument("--log-every",       type=int, default=D.log_every)
-    p.add_argument("--diag-every",      type=int, default=D.diag_every)
-    p.add_argument("--csv-log",         type=str, default=None)
-    # saving
-    p.add_argument("--save-dir",        type=str, default=D.save_dir)
-    p.add_argument("--run-name",        type=str, default=None)
-    p.add_argument("--no-save",         action="store_true")
-    p.add_argument("--save-every",      type=int, default=D.save_every)
-    p.add_argument("--save-model-only", action="store_true")
-    p.add_argument("--resume",          type=str, default=None)
-    # interactive
-    p.add_argument("--interactive",     action="store_true")
-    p.add_argument("--no-interactive",  action="store_true")
-
+    p = _build_cli_parser()
     a = p.parse_args(args=arg_list)
-    saw_precision_mode = "--precision-mode" in arg_list
-    saw_legacy_precision_flag = ("--mixed-precision" in arg_list) or ("--no-mixed-precision" in arg_list)
-    if saw_legacy_precision_flag and not saw_precision_mode:
-        a.precision_mode = None
     return TrainConfig(**{
         k.replace("-", "_"): v for k, v in vars(a).items()
     })

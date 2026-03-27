@@ -38,7 +38,7 @@ PyQITNN exposes the following public symbols:
 - PyTorch >= 2.0 with CUDA support
 - Core library default path is full `float32`
 - Canonical mixed mode is `precision_mode="qts_fp32_rest_bf16"`
-- Legacy `mixed_precision=True` is still accepted as a compatibility alias
+- Legacy `mixed_precision=True` is still accepted as a compatibility alias; prefer `precision_mode`
 - Windows or Linux
 - Python >= 3.10
 
@@ -619,6 +619,29 @@ Call this after `optimizer.step()`. Never inside autograd.
 **format_qitnn_diagnostics:**
 
 ```python
+model.collect_qitnn_diagnostics(
+    *,
+    epoch: int,
+    full: bool = False,
+) -> dict[str, object]
+```
+
+Returns the raw structured snapshot for the selected QTS layers.
+
+The returned payload has a stable schema:
+- `schema_version`
+- `epoch`
+- `full`
+- `layer_count`
+- `layers` (list of `{name, label, role, stats}`)
+
+When `full=False`, only a representative subset of layers is included (last block's
+FFN, first and last block's V/O). When `full=True`, all QTS layers are included.
+
+This is the same payload used by the trainer to write `diagnostics.json` and
+`diagnostics_layers.csv`.
+
+```python
 model.format_qitnn_diagnostics(
     *,
     epoch: int,
@@ -628,8 +651,8 @@ model.format_qitnn_diagnostics(
 
 Returns formatted diagnostic lines for QTS layers.
 
-When `full=False`, only a representative subset of layers is shown (last block's
-FFN, first and last block's V/O). When `full=True`, all layers are shown.
+This method formats the raw snapshot from `collect_qitnn_diagnostics()`. It does
+not compute a separate diagnostics path.
 
 **generate:**
 
@@ -921,6 +944,8 @@ PPL = 2 ** BPB
 | `last_epoch_train_tok_s` | float or None | Training throughput in tokens/sec for the final epoch. |
 | `last_epoch_val_tok_s` | float or None | Validation throughput in tokens/sec for the final epoch. |
 | `run_dir` | str or None | Path to the run directory with checkpoints and logs. None if `no_save=True`. |
+| `diagnostics_json` | str or None | Path to the saved structured layer-diagnostics JSON artifact, or `None` when saving is disabled. |
+| `diagnostics_csv` | str or None | Path to the saved layer-level diagnostics CSV artifact, or `None` when saving is disabled. |
 | `model` | QITNNSimplexTransformerLM | The trained model instance on GPU. It is returned as-is; call `model.eval()` yourself before inference if you want eval mode. |
 
 ### Usage from CLI
@@ -1000,13 +1025,14 @@ and what happens when you change it.
 |-------|------|---------|--------------|-------------------------------|
 | `device` | str | `"cuda:0"` | PyTorch device string. | Only `cuda:0` is supported. The CUDA extension checks `get_device() == 0`. |
 | `seed` | int | `7` | Random seed. | Sets both `torch.manual_seed` and `torch.cuda.manual_seed_all`. Same seed = same training trajectory. |
-| `batch_size` | int | `4` | Sequences per training step. | Larger = more stable gradients, more GPU memory. `4` is a good starting point. `8` or `16` if you have enough VRAM. |
+| `batch_size` | int | `4` | Sequences per micro-batch. | This is the per-micro-batch memory knob. Effective batch = `batch_size * grad_accum_steps`. Increase `batch_size` directly when VRAM allows it; otherwise keep it smaller and use accumulation. |
+| `grad_accum_steps` | int | `1` | Micro-batches per optimizer step. | `1` keeps the legacy trainer contract exactly. `N > 1` accumulates `N` micro-batches before one `optimizer.step()`. This increases effective batch without changing optimizer-step counters: `steps`, `steps_per_epoch`, `warmup_steps`, `global_step`, prior, checkpoints, and resume all remain measured in optimizer steps. |
 | `epochs` | int | `20` | Number of training epochs. | Each epoch runs `steps_per_epoch` steps. Ignored if `steps` is set. `5` for quick tests, `50-100` for real training. |
-| `steps_per_epoch` | int | `1000` | Steps per epoch. | Total training steps = `epochs * steps_per_epoch`. Each step processes one batch. |
-| `steps` | int or None | `None` | Total step override. | When set, overrides `epochs` and `steps_per_epoch`. Runs exactly N steps in a single "epoch". Useful for fine-grained control. |
+| `steps_per_epoch` | int | `1000` | Optimizer steps per epoch. | Total optimizer steps = `epochs * steps_per_epoch`. Each optimizer step may contain multiple micro-batches when `grad_accum_steps > 1`. |
+| `steps` | int or None | `None` | Total optimizer-step override. | When set, overrides `epochs` and `steps_per_epoch`. Runs exactly N optimizer steps in a single "epoch". Micro-batch count still scales with `grad_accum_steps`. |
 | `grad_clip` | float | `1.0` | Maximum gradient norm. | `0.0` = no clipping. `1.0` = recommended for AdamW, prevents gradient explosions. Values like `0.5` are more aggressive. |
-| `mixed_precision` | bool or None | `None` | Legacy compatibility alias. | `True` maps to `precision_mode="qts_fp32_rest_bf16"`. `False` maps to `precision_mode="fp32"`. In the standalone trainer this field remains for backward compatibility with older launch scripts. |
-| `precision_mode` | str or None | `"qts_fp32_rest_bf16"` | Canonical trainer precision selector. | Supported modes are `"fp32"` and `"qts_fp32_rest_bf16"`. In the current standalone `BasicQITNN_Transformer.py`, the default resolves to the conservative mixed path unless you override it with `precision_mode="fp32"` or legacy `--no-mixed-precision`. |
+| `precision_mode` | str or None | `None` | Canonical trainer precision selector. | Supported modes are `"fp32"` and `"qts_fp32_rest_bf16"`. When omitted, the standalone trainer resolves this field to the conservative mixed path `qts_fp32_rest_bf16`. Use `precision_mode="fp32"` to force the trusted baseline explicitly. |
+| `mixed_precision` | bool or None | `None` | Legacy compatibility alias. | `True` maps to `precision_mode="qts_fp32_rest_bf16"`. `False` maps to `precision_mode="fp32"`. This field is kept only for backward compatibility with older launch scripts, is hidden from CLI help, and should not be the primary product knob. |
 
 #### Optimizer
 
@@ -1016,7 +1042,7 @@ and what happens when you change it.
 | `lr_start` | float | `0.005` | Starting LR for SGD. | Ignored when `optimizer="adamw"`. |
 | `lr_end` | float | `0.001` | Final LR for SGD. | Ignored when `optimizer="adamw"`. |
 | `lr_schedule` | str | `"cosine"` | LR decay curve. | `"cosine"` = half-cosine, slow start/end, fast middle. Better for longer runs. `"linear"` = straight line from start to end. Applies to both SGD and AdamW LR. |
-| `warmup_steps` | int | `0` | Linear LR warmup length in optimizer steps. | `0` preserves the legacy schedule exactly. `N > 0` ramps LR from `0` to the configured start LR over the first `N` optimizer steps, then the selected `lr_schedule` begins its normal decay toward the end LR. If `warmup_steps` exceeds the full run, the whole run becomes a clean ramp to the start LR. |
+| `warmup_steps` | int | `0` | Linear LR warmup length in optimizer steps. | `0` preserves the legacy schedule exactly. `N > 0` ramps LR from `0` to the configured start LR over the first `N` optimizer steps, then the selected `lr_schedule` begins its normal decay toward the end LR. `grad_accum_steps` does not rescale this counter. If `warmup_steps` exceeds the full run, the whole run becomes a clean ramp to the start LR. |
 
 #### AdamW settings
 
@@ -1120,7 +1146,7 @@ For long training (50+ epochs), combining both works well.
 |-------|------|---------|--------------|-------------------------------|
 | `log_every` | int | `100` | Print training metrics every N steps. | `100` = print at steps 100, 200, etc. within each epoch. Logs include `train_loss`, `train_bpb`, `train_ppl`, throughput, and LR. Lower = more verbose output. |
 | `diag_every` | int | `10` | Full QTS diagnostics every N epochs. | `10` = show all-layer entropy/probability stats every 10 epochs. On other epochs, only a summary subset is printed. `1` = every epoch (verbose). |
-| `csv_log` | str or None | `None` | Path to CSV log file. | `None` = auto-creates `metrics.csv` inside the run directory (if saving is enabled). The CSV stores `train_loss`, `train_bpb`, `train_ppl`, `val_loss`, `val_bpb`, `val_ppl`, throughput, LR, and time. Set to a custom path like `"logs/experiment.csv"` to write there. |
+| `csv_log` | str or None | `None` | Path to epoch-level CSV log file. | `None` = auto-creates `metrics.csv` inside the run directory (if saving is enabled). The CSV stores `train_loss`, `train_bpb`, `train_ppl`, `val_loss`, `val_bpb`, `val_ppl`, throughput, LR, and time. Raw layer diagnostics are written separately to `diagnostics_layers.csv`. Set `csv_log` to a custom path like `"logs/experiment.csv"` only for the epoch-level metric log. |
 
 #### Saving
 
@@ -1128,10 +1154,10 @@ For long training (50+ epochs), combining both works well.
 |-------|------|---------|--------------|-------------------------------|
 | `save_dir` | str | `"runs"` | Base directory for runs. | Each run creates a subdirectory inside this. |
 | `run_name` | str or None | `None` | Subdirectory name. | `None` = auto-generates `run_YYYYMMDD_HHMMSS`. Set to e.g. `"experiment_1"` for a memorable name. Full path: `{save_dir}/{run_name}/`. |
-| `no_save` | bool | `False` | Disable all file output. | `True` = no checkpoints, no CSV, no config.json. The model still trains, you just get it back in memory only. Good for quick tests. |
+| `no_save` | bool | `False` | Disable all file output. | `True` = no checkpoints, no `metrics.csv`, no `diagnostics.json`, no `diagnostics_layers.csv`, and no `config.json`. The model still trains, you just get it back in memory only. Good for quick tests. |
 | `save_every` | int | `25` | Periodic checkpoint every N epochs. | `25` = save at epochs 25, 50, etc. `0` = only save best and final. Files are named `ckpt_ep{N}.pt`. |
 | `save_model_only` | bool | `False` | Slim checkpoints. | `True` = checkpoints contain only model weights (smaller files, can't resume training). `False` = checkpoints include optimizer state too (needed for `resume`). |
-| `resume` | str or None | `None` | Resume from checkpoint. | Path to a `.pt` file. Loads model weights, optimizer state, epoch counter, and best_val. Training continues from where it left off. |
+| `resume` | str or None | `None` | Resume from checkpoint. | Path to a `.pt` file. Loads model weights, optimizer state, epoch/global_step cursors, best-validation metadata, and RNG state. Training continues from the next completed optimizer-step boundary without replay drift. |
 
 **What gets saved in a run directory:**
 
@@ -1139,6 +1165,8 @@ For long training (50+ epochs), combining both works well.
 runs/run_20260317_143022/
   config.json        # all TrainConfig values + param count
   metrics.csv        # epoch, train_loss, train_ppl, val_loss, val_ppl, train_tok_s, val_tok_s, lr, time_s, train_bpb, val_bpb
+  diagnostics.json   # per-epoch structured QTS layer snapshots
+  diagnostics_layers.csv  # one raw layer row per epoch snapshot
   ckpt_best.pt       # best model by val_loss (auto-updated)
   ckpt_ep25.pt       # periodic checkpoint
   ckpt_ep50.pt
@@ -1232,6 +1260,26 @@ result = train(
     no_interactive=True,
 )
 ```
+
+**Larger effective batch without a larger micro-batch footprint:**
+
+```python
+result = train(
+    dataset="my_data.txt",
+    batch_size=2,
+    grad_accum_steps=4,
+    optimizer="adamw",
+    adamw_lr_start=3e-4,
+    adamw_lr_end=3e-5,
+    warmup_steps=100,
+    steps=1000,
+    no_interactive=True,
+)
+```
+
+This keeps the per-micro-batch footprint at `2` sequences while exposing an
+effective batch of `8` sequences per optimizer step. `steps=1000` and
+`warmup_steps=100` are still counted in optimizer steps, not in micro-steps.
 
 **Large model for large data (> 10 MB):**
 

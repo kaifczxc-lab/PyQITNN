@@ -89,7 +89,7 @@ pip install pyqitnn[tokenizers] --no-deps
 import pyqitnn
 
 status = pyqitnn.bridge_status()
-print(pyqitnn.__version__)        # e.g. 0.3.8
+print(pyqitnn.__version__)        # e.g. 0.3.9
 print(status["native_found"])     # True
 print(status["native_loadable"])  # True
 ```
@@ -179,10 +179,12 @@ Set `precision_mode="qts_fp32_rest_bf16"` to enable the conservative mixed path:
 - QITNN master weights stay in `fp32`
 - sensitive math stays in `fp32`: Born normalization, backnorm, entropy/prior, and the attention softmax path
 - training script / CLI: use `TrainConfig(precision_mode="qts_fp32_rest_bf16")` or `--precision-mode qts_fp32_rest_bf16`
-- to force the trusted baseline explicitly from CLI, use `TrainConfig(precision_mode="fp32")`, `--precision-mode fp32`, or legacy `--no-mixed-precision`
-- legacy compatibility still exists: `mixed_precision=True` maps to `qts_fp32_rest_bf16`
+- if you omit `precision_mode` in the standalone trainer, it resolves to `qts_fp32_rest_bf16`
+- to force the trusted baseline explicitly, use `TrainConfig(precision_mode="fp32")` or `--precision-mode fp32`
 
-`BasicQITNN_Transformer.py` currently ships with `TrainConfig.precision_mode="qts_fp32_rest_bf16"` as its standalone trainer default. The lower-level `pyqitnn` modules still default to trusted `fp32` if you omit both `precision_mode` and legacy `mixed_precision`.
+Legacy compatibility still exists for older launch scripts and code paths: `mixed_precision=True/False` and the old CLI flags are still accepted as compatibility aliases, but `precision_mode` is the primary product contract.
+
+The standalone trainer now keeps `TrainConfig.precision_mode=None` by default and resolves it to `qts_fp32_rest_bf16` internally. The lower-level `pyqitnn` modules still default to trusted `fp32` if you omit both `precision_mode` and legacy `mixed_precision`.
 
 ### Generation
 
@@ -256,11 +258,33 @@ The standalone trainer supports `warmup_steps` for optimizer LR warmup.
   first `N` optimizer steps.
 - After warmup, the selected `lr_schedule` (`linear` or `cosine`) decays toward the
   configured end LR.
+
+### Trainer gradient accumulation
+
+The standalone trainer supports `grad_accum_steps` for micro-batch accumulation.
+
+- `grad_accum_steps=1` keeps the legacy trainer contract exactly.
+- One optimizer step consists of `grad_accum_steps` micro-batches, so `effective batch = batch_size * grad_accum_steps`.
+- `steps`, `steps_per_epoch`, `warmup_steps`, LR schedule, `global_step`, prior application, checkpoint boundaries, and resume semantics stay on optimizer-step boundaries, not micro-step boundaries.
+- Console step metrics, return-dict train metrics, and `metrics.csv` stay aggregated on completed optimizer steps and epochs; they do not expose the scaled backward loss used inside each micro-step.
+- Full checkpoints also store the optimizer-step cursor and RNG state, so resume continues from the next optimizer-step boundary without replay drift.
+
+### Trainer diagnostics artifacts
+
+The standalone trainer keeps the console diagnostics and now also writes the same
+QTS layer statistics to dedicated artifacts when saving is enabled.
+
+- `diag_every=N` still controls when full all-layer diagnostics are emitted.
+- Non-full epochs keep the representative subset: last block FFN plus first/last block V/O.
+- Saved runs now include `diagnostics.json` with per-epoch structured snapshots.
+- Saved runs also include `diagnostics_layers.csv` with one raw layer row per epoch.
+- `metrics.csv` remains the epoch-level metric log. Layer-level ternary diagnostics no longer need to be scraped from console output.
 - If `warmup_steps` is longer than the whole run, the run becomes a clean ramp to
   the configured start LR.
 
 ```bash
 python BasicQITNN_Transformer.py --optimizer adamw --adamw-lr-start 3e-4 --adamw-lr-end 3e-5 --lr-schedule cosine --warmup-steps 200 --no-interactive
+python BasicQITNN_Transformer.py --optimizer adamw --batch-size 2 --grad-accum-steps 4 --steps 1000 --warmup-steps 100 --no-interactive
 ```
 
 ---

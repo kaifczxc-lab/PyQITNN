@@ -7,7 +7,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .diagnostics import render_qitnn_diag
+from .diagnostics import format_qitnn_diag_snapshot
+from .diagnostics import qitnn_diag_snapshot
 from .modules import QITNNLinear
 from .modules import _resolve_precision_mode_args
 from .ops import attention2
@@ -204,12 +205,12 @@ class QITNNSimplexTransformerLM(nn.Module):
                 )
             if self.token_emb.weight.dtype != torch.float32 or self.pos_emb.dtype != torch.float32:
                 raise RuntimeError(
-                    "mixed_precision expects fp32 master weights. "
+                    f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
                     "Do not call .half() or .bfloat16() on the model."
                 )
             if self.head.weight.dtype != torch.float32 or (self.head.bias is not None and self.head.bias.dtype != torch.float32):
                 raise RuntimeError(
-                    "mixed_precision expects fp32 master weights. "
+                    f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
                     "Do not call .half() or .bfloat16() on the model."
                 )
 
@@ -326,34 +327,44 @@ class QITNNSimplexTransformerLM(nn.Module):
     # diagnostics
     #====================
 
-    @torch.no_grad()
-    def format_qitnn_diagnostics(self, *, epoch: int, full: bool = False) -> list[str]:
+    def _pick_qitnn_diagnostics(self, *, full: bool = False) -> list[tuple[str, str, QITNNLinear]]:
         all_layers = list(self.iter_qitnn_layers())
 
         if full:
-            picked = all_layers
-        else:
-            last = max(self.layers - 1, 0)
-            wanted = [
-                f"blocks.{last}.ff1",
-                f"blocks.{last}.ff2",
-                "blocks.0.v_proj",
-                "blocks.0.o_proj",
-                f"blocks.{last}.v_proj",
-                f"blocks.{last}.o_proj",
-            ]
-            by_name = {name: (name, role, layer) for name, role, layer in all_layers}
-            seen: set[str] = set()
-            picked = []
-            for w in wanted:
-                if w not in seen and w in by_name:
-                    seen.add(w)
-                    picked.append(by_name[w])
+            return all_layers
 
-        lines: list[str] = []
-        for name, _, layer in picked:
-            lines.extend(render_qitnn_diag(name, layer.a_neg, layer.a_zero, layer.a_pos, epoch=epoch))
-        return lines
+        last = max(self.layers - 1, 0)
+        wanted = [
+            f"blocks.{last}.ff1",
+            f"blocks.{last}.ff2",
+            "blocks.0.v_proj",
+            "blocks.0.o_proj",
+            f"blocks.{last}.v_proj",
+            f"blocks.{last}.o_proj",
+        ]
+        by_name = {name: (name, role, layer) for name, role, layer in all_layers}
+        seen: set[str] = set()
+        picked: list[tuple[str, str, QITNNLinear]] = []
+        for w in wanted:
+            if w not in seen and w in by_name:
+                seen.add(w)
+                picked.append(by_name[w])
+        return picked
+
+    @torch.no_grad()
+    def collect_qitnn_diagnostics(self, *, epoch: int, full: bool = False) -> dict[str, object]:
+        return qitnn_diag_snapshot(
+            (
+                (name, role, layer.a_neg, layer.a_zero, layer.a_pos)
+                for name, role, layer in self._pick_qitnn_diagnostics(full=full)
+            ),
+            epoch=epoch,
+            full=full,
+        )
+
+    @torch.no_grad()
+    def format_qitnn_diagnostics(self, *, epoch: int, full: bool = False) -> list[str]:
+        return format_qitnn_diag_snapshot(self.collect_qitnn_diagnostics(epoch=epoch, full=full))
 
     #====================
     # generation (autoregressive byte-level)

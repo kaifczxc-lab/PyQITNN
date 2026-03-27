@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
 import math
 
 import torch
@@ -10,6 +11,35 @@ import torch
 #====================
 
 MAX_SHANNON_H = math.log2(3.0)
+QITNN_DIAG_SCHEMA_VERSION = 1
+QITNN_DIAG_STAT_KEYS = (
+    "count",
+    "p_neg",
+    "p_zero",
+    "p_pos",
+    "h",
+    "eff",
+    "collapse_pct",
+    "sum_n",
+    "sum_z",
+    "sum_p",
+    "rms_n",
+    "rms_z",
+    "rms_p",
+    "p0_gt_04_pct",
+    "p0_lt_01_pct",
+    "maxp_gt_08_pct",
+    "h_gt_13_pct",
+    "var_h",
+)
+QITNN_DIAG_CSV_HEADER = (
+    "epoch",
+    "full",
+    "layer_name",
+    "layer_label",
+    "role",
+    *QITNN_DIAG_STAT_KEYS,
+)
 
 
 #====================
@@ -106,6 +136,76 @@ def qitnn_diag_stats(
     }
 
 
+def qitnn_diag_record(
+    name: str,
+    role: str,
+    a_neg: torch.Tensor,
+    a_zero: torch.Tensor,
+    a_pos: torch.Tensor,
+) -> dict[str, object]:
+    return {
+        "name": name,
+        "label": short_qitnn_label(name),
+        "role": role,
+        "stats": qitnn_diag_stats(a_neg, a_zero, a_pos),
+    }
+
+
+def qitnn_diag_snapshot(
+    layers: Iterable[tuple[str, str, torch.Tensor, torch.Tensor, torch.Tensor]],
+    *,
+    epoch: int,
+    full: bool,
+) -> dict[str, object]:
+    records = [
+        qitnn_diag_record(name, role, a_neg, a_zero, a_pos)
+        for name, role, a_neg, a_zero, a_pos in layers
+    ]
+    return {
+        "schema_version": QITNN_DIAG_SCHEMA_VERSION,
+        "epoch": int(epoch),
+        "full": bool(full),
+        "layer_count": len(records),
+        "layers": records,
+    }
+
+
+def format_qitnn_diag_record(
+    record: dict[str, object],
+    *,
+    epoch: int | None = None,
+) -> list[str]:
+    return format_qitnn_diag(
+        str(record["label"]),
+        dict(record["stats"]),
+        epoch=epoch,
+    )
+
+
+def format_qitnn_diag_snapshot(snapshot: dict[str, object]) -> list[str]:
+    epoch = snapshot.get("epoch")
+    epoch_value = int(epoch) if epoch is not None else None
+    lines: list[str] = []
+    for record in snapshot.get("layers", []):
+        lines.extend(format_qitnn_diag_record(record, epoch=epoch_value))
+    return lines
+
+
+def iter_qitnn_diag_csv_rows(snapshot: dict[str, object]) -> Iterator[list[object]]:
+    epoch = int(snapshot["epoch"])
+    full = bool(snapshot["full"])
+    for record in snapshot["layers"]:
+        stats = dict(record["stats"])
+        yield [
+            epoch,
+            full,
+            record["name"],
+            record["label"],
+            record["role"],
+            *[stats[key] for key in QITNN_DIAG_STAT_KEYS],
+        ]
+
+
 #====================
 # formatted output
 #====================
@@ -142,4 +242,5 @@ def render_qitnn_diag(
     *,
     epoch: int | None = None,
 ) -> list[str]:
-    return format_qitnn_diag(short_qitnn_label(name), qitnn_diag_stats(a_neg, a_zero, a_pos), epoch=epoch)
+    record = qitnn_diag_record(name, "unknown", a_neg, a_zero, a_pos)
+    return format_qitnn_diag_record(record, epoch=epoch)

@@ -5,13 +5,15 @@ Important: This stress_test created by using AI
 Run: python stress_test.py
 Requires CUDA GPU.
 """
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 import csv
+import io
 import json
 import shutil
 import subprocess
 import sys
 import math
+import re
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -25,10 +27,15 @@ sys.path.insert(0, str(ROOT))
 import pyqitnn
 from BasicQITNN_Transformer import (
     TrainConfig,
+    _capture_rng_state,
+    _build_cli_parser,
     _build_token_byte_lut,
     _count_token_bytes,
     _parse_cli,
+    _resolve_grad_accum_steps,
     _resolve_precision_mode_cfg,
+    _resolve_train_step_plan,
+    _restore_rng_state,
     _resolve_warmup_steps,
     _schedule_progress,
     eval_split_metrics,
@@ -38,13 +45,19 @@ from BasicQITNN_Transformer import (
     lr_with_warmup,
     loss_to_bpb,
     loss_to_perplexity,
+    load_ckpt,
     run_val,
     sample_batch,
+    save_ckpt,
     total_nll_to_bpb,
     train,
 )
+from pyqitnn.diagnostics import QITNN_DIAG_CSV_HEADER
+from pyqitnn.diagnostics import QITNN_DIAG_STAT_KEYS
+from pyqitnn.diagnostics import format_qitnn_diag_snapshot
 from pyqitnn.ops import forward3, prior_, centered_simplex, attention2
 from pyqitnn.bridge import load_native
+from pyqitnn.precision import resolve_precision_mode as resolve_precision_mode_shared
 
 DEVICE = torch.device("cuda:0")
 PASSED = 0
@@ -677,6 +690,226 @@ def test_checkpoint_roundtrip():
     tmp_path.unlink(missing_ok=True)
 
 
+def test_rng_state_helper_roundtrip():
+    print("\n=== test_rng_state_helper_roundtrip ===")
+    torch.manual_seed(314159)
+    torch.cuda.manual_seed_all(271828)
+
+    rng_state = _capture_rng_state()
+    probs = torch.full((1, 11), 1.0 / 11.0, device=DEVICE)
+
+    cpu_ref = torch.randint(0, 1000, (12,), dtype=torch.long)
+    cuda_ref = torch.multinomial(probs, num_samples=9, replacement=True)
+
+    _ = torch.randint(0, 1000, (5,), dtype=torch.long)
+    _ = torch.multinomial(probs, num_samples=4, replacement=True)
+
+    restored = _restore_rng_state(rng_state)
+    cpu_now = torch.randint(0, 1000, (12,), dtype=torch.long)
+    cuda_now = torch.multinomial(probs, num_samples=9, replacement=True)
+
+    check("rng helper reports successful restore", restored, f"restored={restored}")
+    check("rng helper restores CPU torch sequence", torch.equal(cpu_now, cpu_ref), f"cpu_now={cpu_now.tolist()} cpu_ref={cpu_ref.tolist()}")
+    check("rng helper restores CUDA sampling sequence", torch.equal(cuda_now, cuda_ref), f"cuda_now={cuda_now.tolist()} cuda_ref={cuda_ref.tolist()}")
+
+
+def test_checkpoint_payload_includes_rng_state():
+    print("\n=== test_checkpoint_payload_includes_rng_state ===")
+    torch.manual_seed(43)
+    torch.cuda.manual_seed_all(43)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE,
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+    tmp_path = ROOT / "_test_ckpt_rng_payload.pt"
+    try:
+        save_ckpt(tmp_path, model, opt, epoch=3, step=17, best_val=1.25, best_val_epoch=2)
+        ckpt = torch.load(str(tmp_path), map_location="cpu", weights_only=False)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    rng_state = ckpt.get("rng_state")
+    cpu_state = None if rng_state is None else rng_state.get("torch_cpu")
+    cuda_state = None if rng_state is None else rng_state.get("torch_cuda")
+
+    check("checkpoint payload carries rng_state block", isinstance(rng_state, dict), f"type={type(rng_state).__name__}")
+    check("checkpoint payload carries CPU torch RNG", isinstance(cpu_state, torch.Tensor) and cpu_state.dtype == torch.uint8 and cpu_state.device.type == "cpu", f"cpu_state={type(cpu_state).__name__ if cpu_state is not None else None}")
+    check("checkpoint payload carries CUDA RNG list", isinstance(cuda_state, list) and len(cuda_state) >= 1, f"cuda_state={cuda_state}")
+    check("checkpoint payload preserves epoch/global_step", ckpt.get("epoch") == 3 and ckpt.get("global_step") == 17, f"epoch={ckpt.get('epoch')} step={ckpt.get('global_step')}")
+    check("checkpoint payload preserves best_val_epoch metadata", ckpt.get("best_val_epoch") == 2, f"best_val_epoch={ckpt.get('best_val_epoch')}")
+
+
+def test_checkpoint_load_legacy_payload_without_rng_state():
+    print("\n=== test_checkpoint_load_legacy_payload_without_rng_state ===")
+    torch.manual_seed(44)
+    torch.cuda.manual_seed_all(44)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE,
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    tokens = torch.randint(0, 256, (1, 16), device=DEVICE)
+
+    with torch.no_grad():
+        logits_ref, _ = model(tokens)
+
+    legacy_payload = {
+        "model": model.state_dict(),
+        "optimizer": opt.state_dict(),
+        "epoch": 2,
+        "global_step": 9,
+        "best_val_loss": 0.75,
+    }
+
+    model2 = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE,
+    )
+    opt2 = torch.optim.AdamW(model2.parameters(), lr=3e-4)
+    tmp_path = ROOT / "_test_ckpt_legacy_no_rng.pt"
+    try:
+        torch.save(legacy_payload, str(tmp_path))
+        err = capture_runtime_error(lambda: load_ckpt(tmp_path, model2, opt2, DEVICE))
+        with torch.no_grad():
+            logits_now, _ = model2(tokens)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    max_diff = (logits_now - logits_ref).abs().max().item()
+    check("legacy checkpoint without rng_state still loads", err == "", err or "ok")
+    check("legacy checkpoint without rng_state preserves model weights", max_diff < 1e-6, f"diff={max_diff}")
+
+
+def test_checkpoint_resume_restores_batch_rng_exact_fp32():
+    print("\n=== test_checkpoint_resume_restores_batch_rng_exact_fp32 ===")
+
+    tmp_path = ROOT / "_tmp_rng_resume_dataset.txt"
+    save_root = ROOT / "_tmp_rng_resume_runs"
+    run_cont = "rng_resume_cont"
+    run_resumed = "rng_resume_resumed"
+
+    text = (
+        "resume exactness should preserve sampled batch windows across checkpoint restore\n"
+        "this test isolates trainer rng continuity without touching qts math\n"
+    ) * 64
+
+    try:
+        cleanup_tree(save_root)
+        tmp_path.write_text(text, encoding="utf-8")
+
+        common = dict(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="fp32",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=2,
+            optimizer="adamw",
+            adamw_lr_start=3e-4,
+            adamw_lr_end=3e-5,
+            lr_schedule="linear",
+            epochs=2,
+            steps_per_epoch=2,
+            val_steps=4,
+            save_dir=str(save_root),
+            save_every=1,
+            no_interactive=True,
+            prompt="resume",
+            prompt_bytes=6,
+            gen_bytes=0,
+            log_every=2,
+            seed=77,
+        )
+
+        train(run_name=run_cont, **common)
+        resume_ckpt = save_root / run_cont / "ckpt_ep1.pt"
+        train(run_name=run_resumed, resume=str(resume_ckpt), **common)
+
+        cont_ckpt = torch.load(str(save_root / run_cont / "ckpt_final.pt"), map_location="cpu", weights_only=False)
+        resumed_ckpt = torch.load(str(save_root / run_resumed / "ckpt_final.pt"), map_location="cpu", weights_only=False)
+
+        max_diff = max(
+            (cont_ckpt["model"][name] - resumed_ckpt["model"][name]).abs().max().item()
+            for name in cont_ckpt["model"]
+        )
+        best_val_diff = abs(float(cont_ckpt["best_val_loss"]) - float(resumed_ckpt["best_val_loss"]))
+
+        check("resume exactness preserves final fp32 model state", max_diff < 1e-9, f"max_diff={max_diff:.3e}")
+        check("resume exactness preserves final global_step", cont_ckpt["global_step"] == resumed_ckpt["global_step"], f"cont={cont_ckpt['global_step']} resumed={resumed_ckpt['global_step']}")
+        check("resume exactness preserves final epoch", cont_ckpt["epoch"] == resumed_ckpt["epoch"], f"cont={cont_ckpt['epoch']} resumed={resumed_ckpt['epoch']}")
+        check("resume exactness preserves best_val_loss", best_val_diff < 1e-12, f"diff={best_val_diff:.3e}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_root)
+
+
+def test_checkpoint_restore_preserves_generation_rng():
+    print("\n=== test_checkpoint_restore_preserves_generation_rng ===")
+
+    modes = ["fp32"]
+    if torch.cuda.is_bf16_supported():
+        modes.append("qts_fp32_rest_bf16")
+
+    for mode in modes:
+        torch.manual_seed(45)
+        torch.cuda.manual_seed_all(45)
+
+        model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=16,
+            ffn_dim=32,
+            seq_len=16,
+            layers=1,
+            precision_mode=mode,
+            device=DEVICE,
+        )
+        opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+        prompt = torch.tensor([[72, 101, 108, 108, 111]], device=DEVICE, dtype=torch.long)
+
+        model2 = pyqitnn.QITNNSimplexTransformerLM(
+            dim=16,
+            ffn_dim=32,
+            seq_len=16,
+            layers=1,
+            precision_mode=mode,
+            device=DEVICE,
+        )
+        opt2 = torch.optim.AdamW(model2.parameters(), lr=3e-4)
+
+        tmp_path = ROOT / f"_test_ckpt_generation_rng_{mode}.pt"
+        try:
+            save_ckpt(tmp_path, model, opt, epoch=1, step=3, best_val=0.5)
+            with torch.no_grad():
+                out_ref = model.generate(
+                    prompt,
+                    max_new_tokens=12,
+                    temperature=0.8,
+                    top_k=8,
+                    ascii_guard=True,
+                )
+
+            err = capture_runtime_error(lambda: load_ckpt(tmp_path, model2, opt2, DEVICE))
+            with torch.no_grad():
+                out_now = model2.generate(
+                    prompt,
+                    max_new_tokens=12,
+                    temperature=0.8,
+                    top_k=8,
+                    ascii_guard=True,
+                )
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        check(f"generation checkpoint load restores RNG [{mode}]", err == "", err or "ok")
+        check(
+            f"generation checkpoint restore keeps sampled tokens [{mode}]",
+            torch.equal(out_now, out_ref),
+            f"out_now={out_now.tolist()} out_ref={out_ref.tolist()}",
+        )
+
+
 #====================
 # 12. Numerical stability: extreme amplitude scales
 #====================
@@ -1043,13 +1276,579 @@ def test_mixed_precision_cli_defaults():
         lambda: _resolve_precision_mode_cfg(_parse_cli(["--mixed-precision", "--precision-mode", "fp32"]))
     )
 
-    check("TrainConfig default resolves cleanly", train_default in {("fp32", False), ("qts_fp32_rest_bf16", True)}, f"default={train_default}")
+    check("TrainConfig default resolves to canonical trainer mixed path", train_default == ("qts_fp32_rest_bf16", True), f"default={train_default}")
+    check("CLI default keeps precision_mode unset before resolution", default_cfg.precision_mode is None and default_cfg.mixed_precision is None, f"precision_mode={default_cfg.precision_mode} mixed_precision={default_cfg.mixed_precision}")
     check("CLI default preserves TrainConfig default", _resolve_precision_mode_cfg(default_cfg) == train_default, f"resolved={_resolve_precision_mode_cfg(default_cfg)}")
     check("CLI legacy --mixed-precision maps to qts_fp32_rest_bf16", _resolve_precision_mode_cfg(legacy_on_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(legacy_on_cfg)}")
     check("CLI legacy --no-mixed-precision resolves to fp32", _resolve_precision_mode_cfg(legacy_off_cfg) == ("fp32", False), f"resolved={_resolve_precision_mode_cfg(legacy_off_cfg)}")
     check("CLI --precision-mode qts_fp32_rest_bf16 enables mixed path", _resolve_precision_mode_cfg(mode_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(mode_cfg)}")
     check("CLI precision_mode alias normalizes to qts_fp32_rest_bf16", _resolve_precision_mode_cfg(alias_cfg) == ("qts_fp32_rest_bf16", True), f"resolved={_resolve_precision_mode_cfg(alias_cfg)}")
     check("CLI conflicting legacy flag and precision_mode is rejected", "conflict" in conflict_msg, conflict_msg or "no RuntimeError")
+
+
+def test_precision_mode_single_source_of_truth():
+    print("\n=== test_precision_mode_single_source_of_truth ===")
+
+    shared_default = resolve_precision_mode_shared(None, None)
+    trainer_default = _resolve_precision_mode_cfg(TrainConfig())
+    alias_shared = resolve_precision_mode_shared("mixed_bf16_native", None)
+    alias_trainer = _resolve_precision_mode_cfg(TrainConfig(precision_mode="mixed_bf16_native"))
+
+    check("shared resolver keeps library default fp32 when precision omitted", shared_default == ("fp32", False), f"default={shared_default}")
+    check("trainer resolver layers its own default on top of shared contract", trainer_default == ("qts_fp32_rest_bf16", True), f"default={trainer_default}")
+    check("shared resolver normalizes mixed alias", alias_shared == ("qts_fp32_rest_bf16", True), f"resolved={alias_shared}")
+    check("trainer resolver uses same alias normalization", alias_trainer == ("qts_fp32_rest_bf16", True), f"resolved={alias_trainer}")
+
+
+def test_legacy_mixed_precision_python_compat():
+    print("\n=== test_legacy_mixed_precision_python_compat ===")
+
+    legacy_on = _resolve_precision_mode_cfg(TrainConfig(mixed_precision=True))
+    legacy_off = _resolve_precision_mode_cfg(TrainConfig(mixed_precision=False))
+    explicit = _resolve_precision_mode_cfg(TrainConfig(precision_mode="fp32"))
+    conflict_msg = capture_runtime_error(
+        lambda: _resolve_precision_mode_cfg(TrainConfig(precision_mode="fp32", mixed_precision=True))
+    )
+
+    check("TrainConfig legacy mixed_precision=True still resolves cleanly", legacy_on == ("qts_fp32_rest_bf16", True), f"resolved={legacy_on}")
+    check("TrainConfig legacy mixed_precision=False still resolves cleanly", legacy_off == ("fp32", False), f"resolved={legacy_off}")
+    check("TrainConfig explicit precision_mode remains canonical", explicit == ("fp32", False), f"resolved={explicit}")
+    check("TrainConfig rejects conflicting legacy bool and precision_mode", "conflict" in conflict_msg, conflict_msg or "no RuntimeError")
+
+
+def test_cli_help_prefers_precision_mode():
+    print("\n=== test_cli_help_prefers_precision_mode ===")
+
+    help_text = _build_cli_parser().format_help()
+
+    check("CLI help exposes precision_mode as the canonical flag", "--precision-mode" in help_text, help_text)
+    check("CLI help documents the trainer default precision path", "qts_fp32_rest_bf16" in help_text, help_text)
+    check("CLI help hides legacy mixed_precision flags", "--mixed-precision" not in help_text and "--no-mixed-precision" not in help_text, help_text)
+
+
+def test_precision_config_artifact_prefers_canonical_mode():
+    print("\n=== test_precision_config_artifact_prefers_canonical_mode ===")
+
+    tmp_path = ROOT / "_tmp_precision_config_dataset.txt"
+    save_dir = ROOT / "_tmp_precision_config_runs"
+    run_name = "precision_config_contract"
+    config_ok = False
+    config_detail = ""
+
+    text = (
+        "precision config artifact should preserve a canonical trainer contract\n"
+        "legacy trainer toggles may still enter, but saved artifacts should stay explicit\n"
+    ) * 64
+
+    try:
+        shutil.rmtree(save_dir, ignore_errors=True)
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            mixed_precision=False,
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            steps=1,
+            save_dir=str(save_dir),
+            run_name=run_name,
+            no_interactive=True,
+            prompt="hello simplex",
+            prompt_bytes=16,
+            gen_bytes=0,
+            log_every=1,
+        )
+
+        config_path = Path(result["run_dir"]) / "config.json"
+        if config_path.exists():
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            config_ok = (
+                cfg.get("precision_mode") == "fp32"
+                and cfg.get("precision_mode_requested") is None
+                and cfg.get("precision_mode_resolved") == "fp32"
+                and cfg.get("legacy_mixed_precision_input") is False
+            )
+            config_detail = json.dumps(
+                {
+                    "precision_mode": cfg.get("precision_mode"),
+                    "precision_mode_requested": cfg.get("precision_mode_requested"),
+                    "precision_mode_resolved": cfg.get("precision_mode_resolved"),
+                    "legacy_mixed_precision_input": cfg.get("legacy_mixed_precision_input"),
+                },
+                ensure_ascii=False,
+            )
+        else:
+            config_detail = str(config_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(save_dir, ignore_errors=True)
+
+    check("trainer config artifact keeps canonical precision_mode", config_ok, config_detail)
+
+
+def test_diagnostics_schema_contract():
+    print("\n=== test_diagnostics_schema_contract ===")
+
+    torch.manual_seed(42)
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=16,
+        ffn_dim=32,
+        seq_len=16,
+        layers=1,
+        device=DEVICE,
+    )
+
+    snapshot = model.collect_qitnn_diagnostics(epoch=3, full=False)
+    formatted = model.format_qitnn_diagnostics(epoch=3, full=False)
+    formatted_from_snapshot = format_qitnn_diag_snapshot(snapshot)
+    layers = snapshot.get("layers", [])
+    first = layers[0] if layers else {}
+    stats = first.get("stats", {})
+
+    schema_ok = (
+        snapshot.get("schema_version") == 1
+        and snapshot.get("epoch") == 3
+        and snapshot.get("full") is False
+        and snapshot.get("layer_count") == 4
+        and len(layers) == 4
+        and set(first.keys()) == {"name", "label", "role", "stats"}
+        and tuple(stats.keys()) == QITNN_DIAG_STAT_KEYS
+    )
+
+    check("diagnostics snapshot keeps a stable schema", schema_ok, json.dumps(snapshot, ensure_ascii=False))
+    check("summary diagnostics keep the expected representative layer count", len(layers) == 4, f"layer_count={len(layers)}")
+    check("formatted diagnostics are derived from the raw snapshot", formatted == formatted_from_snapshot, "\n".join(formatted_from_snapshot))
+
+
+def _run_diag_artifact_train(run_name: str):
+    tmp_path = ROOT / f"_tmp_{run_name}_dataset.txt"
+    save_dir = ROOT / "_tmp_diag_runs"
+    text = (
+        "qitnn diagnostics artifacts should preserve raw layer statistics across epochs\n"
+        "summary epochs keep a representative subset and full epochs keep all qitnn layers\n"
+    ) * 64
+
+    cleanup_tree(save_dir)
+    tmp_path.write_text(text, encoding="utf-8")
+    result = train(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=16,
+        batch_size=1,
+        epochs=2,
+        steps_per_epoch=1,
+        diag_every=2,
+        save_dir=str(save_dir),
+        run_name=run_name,
+        no_interactive=True,
+        prompt="diag",
+        prompt_bytes=8,
+        gen_bytes=0,
+        log_every=1,
+    )
+    return tmp_path, save_dir, result
+
+
+def test_trainer_writes_diag_json():
+    print("\n=== test_trainer_writes_diag_json ===")
+
+    tmp_path = None
+    save_dir = None
+    json_ok = False
+    json_detail = ""
+
+    try:
+        tmp_path, save_dir, result = _run_diag_artifact_train("diag_json_contract")
+        diag_path = Path(result["diagnostics_json"]) if result["diagnostics_json"] else Path()
+        if diag_path.exists():
+            payload = json.loads(diag_path.read_text(encoding="utf-8"))
+            epochs = payload.get("epochs", [])
+            first_epoch = epochs[0] if len(epochs) > 0 else {}
+            second_epoch = epochs[1] if len(epochs) > 1 else {}
+            json_ok = (
+                payload.get("kind") == "qitnn_layer_diagnostics"
+                and payload.get("schema_version") == 1
+                and payload.get("stats_keys") == list(QITNN_DIAG_STAT_KEYS)
+                and len(epochs) == 2
+                and first_epoch.get("epoch") == 1
+                and first_epoch.get("full") is False
+                and first_epoch.get("layer_count") == 4
+                and len(first_epoch.get("layers", [])) == 4
+                and second_epoch.get("epoch") == 2
+                and second_epoch.get("full") is True
+                and second_epoch.get("layer_count") == 6
+                and len(second_epoch.get("layers", [])) == 6
+            )
+            json_detail = json.dumps(
+                {
+                    "schema_version": payload.get("schema_version"),
+                    "epochs": len(epochs),
+                    "epoch1": {
+                        "full": first_epoch.get("full"),
+                        "layer_count": first_epoch.get("layer_count"),
+                    },
+                    "epoch2": {
+                        "full": second_epoch.get("full"),
+                        "layer_count": second_epoch.get("layer_count"),
+                    },
+                },
+                ensure_ascii=False,
+            )
+        else:
+            json_detail = str(diag_path)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        if save_dir is not None:
+            cleanup_tree(save_dir)
+
+    check("trainer writes diagnostics.json with stable epoch snapshots", json_ok, json_detail)
+
+
+def test_trainer_writes_diag_csv():
+    print("\n=== test_trainer_writes_diag_csv ===")
+
+    tmp_path = None
+    save_dir = None
+    csv_ok = False
+    csv_detail = ""
+
+    try:
+        tmp_path, save_dir, result = _run_diag_artifact_train("diag_csv_contract")
+        diag_json_path = Path(result["diagnostics_json"]) if result["diagnostics_json"] else Path()
+        diag_csv_path = Path(result["diagnostics_csv"]) if result["diagnostics_csv"] else Path()
+        metrics_path = Path(result["run_dir"]) / "metrics.csv"
+
+        if diag_json_path.exists() and diag_csv_path.exists() and metrics_path.exists():
+            payload = json.loads(diag_json_path.read_text(encoding="utf-8"))
+            json_rows = {}
+            for epoch_payload in payload.get("epochs", []):
+                epoch = int(epoch_payload["epoch"])
+                for layer in epoch_payload.get("layers", []):
+                    json_rows[(epoch, layer["name"])] = {
+                        "full": bool(epoch_payload["full"]),
+                        "label": layer["label"],
+                        "role": layer["role"],
+                        "stats": layer["stats"],
+                    }
+
+            with open(diag_csv_path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                diag_rows = list(reader)
+                diag_header = reader.fieldnames
+
+            with open(metrics_path, newline="", encoding="utf-8") as f:
+                metrics_reader = csv.reader(f)
+                metrics_header = next(metrics_reader, [])
+
+            epoch_counts: dict[int, int] = {}
+            parity_ok = len(diag_rows) == len(json_rows)
+            parity_detail = ""
+            for row in diag_rows:
+                epoch = int(row["epoch"])
+                key = (epoch, row["layer_name"])
+                epoch_counts[epoch] = epoch_counts.get(epoch, 0) + 1
+                expected = json_rows.get(key)
+                if expected is None:
+                    parity_ok = False
+                    parity_detail = f"missing json row for {key}"
+                    break
+                if (row["full"].lower() == "true") != expected["full"]:
+                    parity_ok = False
+                    parity_detail = f"full mismatch for {key}: csv={row['full']} json={expected['full']}"
+                    break
+                if row["layer_label"] != expected["label"] or row["role"] != expected["role"]:
+                    parity_ok = False
+                    parity_detail = (
+                        f"label/role mismatch for {key}: "
+                        f"csv=({row['layer_label']}, {row['role']}) json=({expected['label']}, {expected['role']})"
+                    )
+                    break
+                for stat_key in QITNN_DIAG_STAT_KEYS:
+                    csv_value = float(row[stat_key])
+                    json_value = float(expected["stats"][stat_key])
+                    if abs(csv_value - json_value) > 1e-9:
+                        parity_ok = False
+                        parity_detail = (
+                            f"{stat_key} mismatch for {key}: "
+                            f"csv={csv_value:.12f} json={json_value:.12f}"
+                        )
+                        break
+                if not parity_ok:
+                    break
+
+            metrics_ok = metrics_header == [
+                "epoch",
+                "train_loss",
+                "train_ppl",
+                "val_loss",
+                "val_ppl",
+                "train_tok_s",
+                "val_tok_s",
+                "lr",
+                "time_s",
+                "train_bpb",
+                "val_bpb",
+            ]
+            csv_ok = (
+                diag_header == list(QITNN_DIAG_CSV_HEADER)
+                and epoch_counts == {1: 4, 2: 6}
+                and parity_ok
+                and metrics_ok
+            )
+            csv_detail = parity_detail or json.dumps(
+                {
+                    "diag_rows": len(diag_rows),
+                    "epoch_counts": epoch_counts,
+                    "metrics_header": metrics_header,
+                },
+                ensure_ascii=False,
+            )
+        else:
+            csv_detail = json.dumps(
+                {
+                    "diagnostics_json": str(diag_json_path),
+                    "diagnostics_csv": str(diag_csv_path),
+                    "metrics_csv": str(metrics_path),
+                },
+                ensure_ascii=False,
+            )
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        if save_dir is not None:
+            cleanup_tree(save_dir)
+
+    check("trainer writes diagnostics_layers.csv with raw layer rows", csv_ok, csv_detail)
+
+
+def test_trainer_writes_diag_artifacts_under_mixed_multilayer_stress():
+    print("\n=== test_trainer_writes_diag_artifacts_under_mixed_multilayer_stress ===")
+
+    tmp_path = ROOT / "_tmp_diag_mixed_multilayer_dataset.txt"
+    save_dir = ROOT / "_tmp_diag_mixed_multilayer_runs"
+    run_name = "diag_mixed_multilayer_stress"
+    stress_ok = False
+    stress_detail = ""
+
+    text = (
+        "layer diagnostics should survive mixed precision, repeated epochs, and larger qitnn stacks without drift\n"
+        "full epochs must serialize every qitnn layer while summary epochs keep only the representative subset\n"
+        "the artifact contract must remain exact even when the trainer is under a heavier mixed-path load\n"
+    ) * 192
+
+    try:
+        cleanup_tree(save_dir)
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="qts_fp32_rest_bf16",
+            dim=24,
+            ffn=48,
+            layers=3,
+            seq_len=24,
+            batch_size=2,
+            epochs=3,
+            steps_per_epoch=2,
+            diag_every=3,
+            save_dir=str(save_dir),
+            run_name=run_name,
+            no_interactive=True,
+            prompt="diag mixed",
+            prompt_bytes=12,
+            gen_bytes=0,
+            log_every=1,
+        )
+
+        diag_json_path = Path(result["diagnostics_json"]) if result["diagnostics_json"] else Path()
+        diag_csv_path = Path(result["diagnostics_csv"]) if result["diagnostics_csv"] else Path()
+        metrics_path = Path(result["run_dir"]) / "metrics.csv"
+        config_path = Path(result["run_dir"]) / "config.json"
+
+        if diag_json_path.exists() and diag_csv_path.exists() and metrics_path.exists() and config_path.exists():
+            payload = json.loads(diag_json_path.read_text(encoding="utf-8"))
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            epochs = payload.get("epochs", [])
+            epoch_flags = [bool(ep.get("full")) for ep in epochs]
+            epoch_counts = [int(ep.get("layer_count", -1)) for ep in epochs]
+
+            with open(diag_csv_path, newline="", encoding="utf-8") as f:
+                diag_reader = csv.DictReader(f)
+                diag_rows = list(diag_reader)
+                diag_header = diag_reader.fieldnames
+
+            with open(metrics_path, newline="", encoding="utf-8") as f:
+                metrics_reader = csv.reader(f)
+                metrics_rows = list(metrics_reader)
+
+            expected_epoch_counts = [6, 6, 18]
+            finite_ok = True
+            finite_detail = ""
+            for epoch_payload in epochs:
+                for layer in epoch_payload.get("layers", []):
+                    stats = layer.get("stats", {})
+                    if tuple(stats.keys()) != QITNN_DIAG_STAT_KEYS:
+                        finite_ok = False
+                        finite_detail = f"stats key order mismatch for {layer.get('name')}"
+                        break
+                    count_value = float(stats["count"])
+                    if count_value <= 0.0:
+                        finite_ok = False
+                        finite_detail = f"non-positive count for {layer.get('name')}: {count_value}"
+                        break
+                    for key, value in stats.items():
+                        if not math.isfinite(float(value)):
+                            finite_ok = False
+                            finite_detail = f"non-finite {key} for {layer.get('name')}: {value}"
+                            break
+                    if not finite_ok:
+                        break
+                if not finite_ok:
+                    break
+
+            stress_ok = (
+                payload.get("kind") == "qitnn_layer_diagnostics"
+                and payload.get("schema_version") == 1
+                and payload.get("stats_keys") == list(QITNN_DIAG_STAT_KEYS)
+                and diag_header == list(QITNN_DIAG_CSV_HEADER)
+                and len(epochs) == 3
+                and epoch_flags == [False, False, True]
+                and epoch_counts == expected_epoch_counts
+                and len(diag_rows) == sum(expected_epoch_counts)
+                and len(metrics_rows) == 4
+                and config.get("diagnostics_json") == str(diag_json_path)
+                and config.get("diagnostics_csv") == str(diag_csv_path)
+                and result["precision_mode"] == "qts_fp32_rest_bf16"
+                and result["mixed_precision"] is True
+                and finite_ok
+            )
+            stress_detail = finite_detail or json.dumps(
+                {
+                    "epoch_flags": epoch_flags,
+                    "epoch_counts": epoch_counts,
+                    "diag_rows": len(diag_rows),
+                    "metrics_rows": len(metrics_rows),
+                    "precision_mode": result["precision_mode"],
+                    "mixed_precision": result["mixed_precision"],
+                },
+                ensure_ascii=False,
+            )
+        else:
+            stress_detail = json.dumps(
+                {
+                    "diagnostics_json": str(diag_json_path),
+                    "diagnostics_csv": str(diag_csv_path),
+                    "metrics_csv": str(metrics_path),
+                    "config_json": str(config_path),
+                },
+                ensure_ascii=False,
+            )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_dir)
+
+    check("trainer diagnostics artifacts survive mixed multilayer stress", stress_ok, stress_detail)
+
+
+def test_diag_artifacts_resume_same_run_prunes_future_epochs():
+    print("\n=== test_diag_artifacts_resume_same_run_prunes_future_epochs ===")
+
+    tmp_path = ROOT / "_tmp_diag_resume_same_run_dataset.txt"
+    save_dir = ROOT / "_tmp_diag_resume_same_run_runs"
+    run_name = "diag_resume_same_run"
+    resume_ok = False
+    resume_detail = ""
+
+    text = (
+        "resume-safe diagnostics artifacts must drop stale future epochs before appending fresh snapshots\n"
+        "the final artifacts after resume into the same run directory must match the canonical single-run result exactly\n"
+        "this check stresses same-path overwrite behavior without touching qts math or simplex geometry\n"
+    ) * 160
+
+    precision_mode = "qts_fp32_rest_bf16" if torch.cuda.is_bf16_supported() else "fp32"
+
+    try:
+        cleanup_tree(save_dir)
+        tmp_path.write_text(text, encoding="utf-8")
+
+        common = dict(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode=precision_mode,
+            dim=24,
+            ffn=48,
+            layers=2,
+            seq_len=24,
+            batch_size=2,
+            epochs=3,
+            steps_per_epoch=2,
+            diag_every=3,
+            save_dir=str(save_dir),
+            run_name=run_name,
+            save_every=1,
+            no_interactive=True,
+            prompt="diag resume",
+            prompt_bytes=12,
+            gen_bytes=0,
+            log_every=1,
+            seed=91,
+        )
+
+        base = train(**common)
+        run_dir = Path(base["run_dir"])
+        diag_json_path = run_dir / "diagnostics.json"
+        diag_csv_path = run_dir / "diagnostics_layers.csv"
+        resume_ckpt = run_dir / "ckpt_ep1.pt"
+
+        base_json_text = diag_json_path.read_text(encoding="utf-8")
+        base_csv_text = diag_csv_path.read_text(encoding="utf-8")
+        base_json = json.loads(base_json_text)
+        base_csv_rows = list(csv.DictReader(base_csv_text.splitlines()))
+
+        resumed = train(resume=str(resume_ckpt), **common)
+        resumed_json_text = diag_json_path.read_text(encoding="utf-8")
+        resumed_csv_text = diag_csv_path.read_text(encoding="utf-8")
+        resumed_json = json.loads(resumed_json_text)
+        resumed_csv_rows = list(csv.DictReader(resumed_csv_text.splitlines()))
+
+        epoch_layer_pairs = [(int(row["epoch"]), row["layer_name"]) for row in resumed_csv_rows]
+        pair_uniques = len(epoch_layer_pairs) == len(set(epoch_layer_pairs))
+
+        resume_ok = (
+            resumed["run_dir"] == base["run_dir"]
+            and base_json_text == resumed_json_text
+            and base_csv_text == resumed_csv_text
+            and [int(ep["epoch"]) for ep in resumed_json.get("epochs", [])] == [1, 2, 3]
+            and [bool(ep["full"]) for ep in resumed_json.get("epochs", [])] == [False, False, True]
+            and len(resumed_csv_rows) == len(base_csv_rows)
+            and pair_uniques
+        )
+        resume_detail = json.dumps(
+            {
+                "precision_mode": precision_mode,
+                "run_dir_same": resumed["run_dir"] == base["run_dir"],
+                "json_equal": base_json_text == resumed_json_text,
+                "csv_equal": base_csv_text == resumed_csv_text,
+                "epochs": [int(ep["epoch"]) for ep in resumed_json.get("epochs", [])],
+                "full_flags": [bool(ep["full"]) for ep in resumed_json.get("epochs", [])],
+                "row_count": len(resumed_csv_rows),
+                "unique_pairs": pair_uniques,
+            },
+            ensure_ascii=False,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_dir)
+
+    check("resume into the same run dir keeps diagnostics artifacts canonical", resume_ok, resume_detail)
 
 
 #====================
@@ -1087,7 +1886,1323 @@ def test_sample_batch_contract():
 
 
 #====================
-# 19. Warmup contract: scheduler warmup must be explicit, reversible, and CLI-addressable
+# 19. Grad accumulation contract: config/CLI/step semantics must be fixed before loop changes
+#====================
+
+def test_grad_accumulation_config_contract():
+    print("\n=== test_grad_accumulation_config_contract ===")
+
+    default_cfg = TrainConfig()
+    none_resolved = _resolve_grad_accum_steps(None)
+    explicit_resolved = _resolve_grad_accum_steps(4)
+    zero_msg = capture_runtime_error(lambda: _resolve_grad_accum_steps(0))
+    neg_msg = capture_runtime_error(lambda: _resolve_grad_accum_steps(-3))
+
+    check("TrainConfig default keeps grad accumulation disabled", default_cfg.grad_accum_steps == 1, f"grad_accum_steps={default_cfg.grad_accum_steps}")
+    check("grad accumulation resolver treats None as legacy single-step mode", none_resolved == 1, f"resolved={none_resolved}")
+    check("grad accumulation resolver preserves explicit positive values", explicit_resolved == 4, f"resolved={explicit_resolved}")
+    check("zero grad_accum_steps is rejected", ">= 1" in zero_msg, zero_msg or "no RuntimeError")
+    check("negative grad_accum_steps is rejected", ">= 1" in neg_msg, neg_msg or "no RuntimeError")
+
+
+def test_grad_accumulation_cli_contract():
+    print("\n=== test_grad_accumulation_cli_contract ===")
+
+    default_cfg = _parse_cli([])
+    cli_cfg = _parse_cli(["--grad-accum-steps", "8"])
+    help_text = _build_cli_parser().format_help()
+
+    check("CLI default keeps grad_accum_steps at legacy value 1", default_cfg.grad_accum_steps == 1, f"grad_accum_steps={default_cfg.grad_accum_steps}")
+    check("CLI parses grad_accum_steps", cli_cfg.grad_accum_steps == 8, f"grad_accum_steps={cli_cfg.grad_accum_steps}")
+    check("CLI help exposes grad_accum_steps", "--grad-accum-steps" in help_text, help_text)
+    check("CLI help documents legacy single-step contract", "Use 1 to keep" in help_text and "legacy trainer contract" in help_text, help_text)
+
+
+def test_grad_accumulation_step_semantics_contract():
+    print("\n=== test_grad_accumulation_step_semantics_contract ===")
+
+    base_plan = _resolve_train_step_plan(TrainConfig(epochs=3, steps_per_epoch=5, grad_accum_steps=4))
+    override_plan = _resolve_train_step_plan(TrainConfig(epochs=9, steps_per_epoch=5, steps=7, grad_accum_steps=4))
+
+    check("grad_accum_steps does not change optimizer-step budget", base_plan == (3, 5, 15, 4), f"plan={base_plan}")
+    check("steps override remains optimizer-step budget when grad_accum_steps is set", override_plan == (1, 7, 7, 4), f"plan={override_plan}")
+
+    tmp_path = ROOT / "_tmp_grad_accum_contract_dataset.txt"
+    save_dir = ROOT / "_tmp_grad_accum_contract_runs"
+    run_name = "grad_accum_contract"
+    artifact_ok = False
+    artifact_detail = ""
+
+    text = (
+        "grad accumulation contract artifact should stay on optimizer-step semantics\n"
+        "substep one must not change the actual training loop yet\n"
+    ) * 64
+
+    try:
+        cleanup_tree(save_dir)
+        tmp_path.write_text(text, encoding="utf-8")
+        result = train(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="fp32",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            grad_accum_steps=4,
+            steps=3,
+            save_dir=str(save_dir),
+            run_name=run_name,
+            save_every=999,
+            no_interactive=True,
+            prompt="grad accum",
+            prompt_bytes=10,
+            gen_bytes=0,
+            log_every=1,
+        )
+
+        cfg_path = Path(result["run_dir"]) / "config.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            artifact_ok = (
+                result.get("grad_accum_steps") == 4
+                and result.get("optimizer_steps_per_epoch") == 3
+                and result.get("optimizer_total_steps") == 3
+                and int(cfg.get("grad_accum_steps", -1)) == 4
+                and int(cfg.get("optimizer_steps_per_epoch", -1)) == 3
+                and int(cfg.get("optimizer_total_steps", -1)) == 3
+            )
+            artifact_detail = json.dumps(
+                {
+                    "result_grad_accum_steps": result.get("grad_accum_steps"),
+                    "result_optimizer_steps_per_epoch": result.get("optimizer_steps_per_epoch"),
+                    "result_optimizer_total_steps": result.get("optimizer_total_steps"),
+                    "config_grad_accum_steps": cfg.get("grad_accum_steps"),
+                    "config_optimizer_steps_per_epoch": cfg.get("optimizer_steps_per_epoch"),
+                    "config_optimizer_total_steps": cfg.get("optimizer_total_steps"),
+                },
+                ensure_ascii=False,
+            )
+        else:
+            artifact_detail = str(cfg_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_dir)
+
+    check("trainer persists optimizer-step semantics for grad accumulation contract", artifact_ok, artifact_detail)
+
+
+#====================
+# 20. Grad accumulation execution: scaled micro-batches must match one optimizer-step reference
+#====================
+
+def _run_train_with_patched_batches(
+    sample_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    capture_stdout: bool = False,
+    **kwargs,
+):
+    calls = {"count": 0}
+
+    def fake_sample_batch(data, batch, seq_len, device):
+        idx = calls["count"]
+        calls["count"] += 1
+        if idx >= len(sample_batches):
+            raise RuntimeError(
+                f"sample_batch called {calls['count']} times, but only {len(sample_batches)} batches were prepared"
+            )
+        x, y = sample_batches[idx]
+        return x.clone().to(device), y.clone().to(device)
+
+    if capture_stdout:
+        buf = io.StringIO()
+        with patch("BasicQITNN_Transformer.sample_batch", side_effect=fake_sample_batch):
+            with redirect_stdout(buf):
+                result = train(**kwargs)
+        return result, calls["count"], buf.getvalue()
+
+    with patch("BasicQITNN_Transformer.sample_batch", side_effect=fake_sample_batch):
+        result = train(**kwargs)
+    return result, calls["count"]
+
+
+def _model_state_max_abs_diff(left, right) -> tuple[float, str]:
+    left_state = left.state_dict()
+    right_state = right.state_dict()
+    max_diff = 0.0
+    worst_name = ""
+    for name, left_value in left_state.items():
+        right_value = right_state[name]
+        if left_value.dtype.is_floating_point:
+            diff = (left_value.detach().float().cpu() - right_value.detach().float().cpu()).abs().max().item()
+        else:
+            diff = 0.0 if torch.equal(left_value.detach().cpu(), right_value.detach().cpu()) else 1.0
+        if diff > max_diff:
+            max_diff = diff
+            worst_name = name
+    return max_diff, worst_name
+
+
+def _extract_logged_train_metrics(stdout: str) -> tuple[list[tuple[float, float, float]], tuple[float, float, float] | None]:
+    pattern = re.compile(r"train_loss=([0-9.]+)\s+train_bpb=([0-9.]+)\s+train_ppl=([0-9.]+)")
+    step_rows: list[tuple[float, float, float]] = []
+    epoch_row: tuple[float, float, float] | None = None
+
+    for line in stdout.splitlines():
+        match = pattern.search(line)
+        if match is None:
+            continue
+        row = (float(match.group(1)), float(match.group(2)), float(match.group(3)))
+        if line.startswith("  ["):
+            step_rows.append(row)
+        elif line.startswith("epoch "):
+            epoch_row = row
+
+    return step_rows, epoch_row
+
+
+def _train_metric_rows_close(
+    left: tuple[float, float, float],
+    right: tuple[float, float, float],
+    *,
+    loss_tol: float = 1e-6,
+    coarse_tol: float = 5e-5,
+) -> bool:
+    return (
+        abs(left[0] - right[0]) < loss_tol
+        and abs(left[1] - right[1]) < coarse_tol
+        and abs(left[2] - right[2]) < coarse_tol
+    )
+
+
+def _run_train_capture_stdout(**kwargs):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        result = train(**kwargs)
+    return result, buf.getvalue()
+
+
+def _extract_logged_step_lrs(stdout: str) -> list[str]:
+    pattern = re.compile(r"^\s+\[\d+\].*lr=([0-9.]+)$")
+    lrs: list[str] = []
+    for line in stdout.splitlines():
+        match = pattern.search(line)
+        if match is not None:
+            lrs.append(match.group(1))
+    return lrs
+
+
+def _build_grad_accum_parity_batch_plan(
+    *,
+    steps: int,
+    micro_batch_size: int,
+    grad_accum_steps: int,
+    seq_len: int,
+    offset: int = 5,
+) -> tuple[list[tuple[torch.Tensor, torch.Tensor]], list[tuple[torch.Tensor, torch.Tensor]]]:
+    base = torch.arange(seq_len, dtype=torch.long)
+    accum_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    ref_batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    for step_idx in range(steps):
+        step_xs: list[torch.Tensor] = []
+        step_ys: list[torch.Tensor] = []
+        for micro_idx in range(grad_accum_steps):
+            row_offsets = (
+                offset
+                + step_idx * (grad_accum_steps * micro_batch_size * (seq_len + 11))
+                + micro_idx * (micro_batch_size * (seq_len + 7))
+                + torch.arange(micro_batch_size, dtype=torch.long).unsqueeze(1) * (seq_len + 5)
+            )
+            x = (base.unsqueeze(0) + row_offsets) % 251
+            y = (x + 3 + step_idx + micro_idx) % 251
+            x = x.to(device=DEVICE)
+            y = y.to(device=DEVICE)
+            accum_batches.append((x, y))
+            step_xs.append(x)
+            step_ys.append(y)
+        ref_batches.append((torch.cat(step_xs, dim=0), torch.cat(step_ys, dim=0)))
+
+    return accum_batches, ref_batches
+
+
+def test_grad_accumulation_loss_scaling_contract():
+    print("\n=== test_grad_accumulation_loss_scaling_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_loss_scaling.txt"
+    text = ("grad accumulation loss scaling contract\n" * 128)
+    x0 = torch.tensor([[5, 7, 9, 11, 13, 15, 17, 19]], dtype=torch.long, device=DEVICE)
+    y0 = torch.tensor([[7, 9, 11, 13, 15, 17, 19, 21]], dtype=torch.long, device=DEVICE)
+    x1 = torch.tensor([[23, 25, 27, 29, 31, 33, 35, 37]], dtype=torch.long, device=DEVICE)
+    y1 = torch.tensor([[25, 27, 29, 31, 33, 35, 37, 39]], dtype=torch.long, device=DEVICE)
+    accum_batches = [(x0, y0), (x1, y1)]
+    ref_batches = [(torch.cat([x0, x1], dim=0), torch.cat([y0, y1], dim=0))]
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.05,
+        lr_end=0.05,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=1,
+        no_save=True,
+        no_interactive=True,
+        prompt="grad accum",
+        prompt_bytes=10,
+        gen_bytes=0,
+        log_every=1,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, accum_calls = _run_train_with_patched_batches(
+            accum_batches,
+            batch_size=1,
+            grad_accum_steps=2,
+            **common,
+        )
+        ref_result, ref_calls = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=2,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    max_diff, worst_name = _model_state_max_abs_diff(accum_result["model"], ref_result["model"])
+    loss_diff = abs(float(accum_result["last_epoch_train_loss"]) - float(ref_result["last_epoch_train_loss"]))
+    bpb_left = accum_result["last_epoch_train_bpb"]
+    bpb_right = ref_result["last_epoch_train_bpb"]
+    bpb_diff = 0.0 if bpb_left is None or bpb_right is None else abs(float(bpb_left) - float(bpb_right))
+
+    check("grad accumulation uses one sample_batch call per micro-batch", accum_calls == 2 and ref_calls == 1, f"accum_calls={accum_calls} ref_calls={ref_calls}")
+    check("grad accumulation loss scaling matches one large optimizer-step reference", max_diff < 1e-6, f"max_diff={max_diff:.3e} worst={worst_name}")
+    check("grad accumulation keeps optimizer-step train loss aligned with large-batch reference", loss_diff < 1e-6, f"loss_diff={loss_diff:.3e}")
+    check("grad accumulation keeps optimizer-step BPB aligned with large-batch reference", bpb_diff < 1e-6, f"bpb_diff={bpb_diff:.3e}")
+
+
+def test_grad_accumulation_optimizer_step_count_contract():
+    print("\n=== test_grad_accumulation_optimizer_step_count_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_step_count.txt"
+    text = ("grad accumulation optimizer step count contract\n" * 128)
+    counts = {"sample": 0, "step": 0, "prior": 0}
+    orig_step = torch.optim.AdamW.step
+    orig_prior = pyqitnn.QITNNSimplexTransformerLM.apply_qitnn_prior
+
+    def sample_wrapper(data, batch, seq_len, device):
+        counts["sample"] += 1
+        return sample_batch(data, batch, seq_len, device)
+
+    def step_wrapper(self, *args, **kwargs):
+        counts["step"] += 1
+        return orig_step(self, *args, **kwargs)
+
+    def prior_wrapper(self, *args, **kwargs):
+        counts["prior"] += 1
+        return orig_prior(self, *args, **kwargs)
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        with patch("BasicQITNN_Transformer.sample_batch", side_effect=sample_wrapper):
+            with patch.object(torch.optim.AdamW, "step", new=step_wrapper):
+                with patch.object(pyqitnn.QITNNSimplexTransformerLM, "apply_qitnn_prior", new=prior_wrapper):
+                    result = train(
+                        dataset=str(tmp_path),
+                        tokenizer="byte",
+                        precision_mode="fp32",
+                        dim=16,
+                        ffn=32,
+                        layers=1,
+                        seq_len=8,
+                        batch_size=1,
+                        grad_accum_steps=3,
+                        optimizer="adamw",
+                        steps=2,
+                        grad_clip=0.0,
+                        ent_lambda=0.0,
+                        trit_floor_h=0.0,
+                        no_save=True,
+                        no_interactive=True,
+                        prompt="step count",
+                        prompt_bytes=10,
+                        gen_bytes=0,
+                        log_every=1,
+                    )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    detail = json.dumps(
+        {
+            "sample_calls": counts["sample"],
+            "step_calls": counts["step"],
+            "prior_calls": counts["prior"],
+            "optimizer_total_steps": result["optimizer_total_steps"],
+        },
+        ensure_ascii=False,
+    )
+    check("grad accumulation samples one batch per micro-step", counts["sample"] == 6, detail)
+    check("grad accumulation calls optimizer.step once per optimizer-step", counts["step"] == 2, detail)
+    check("grad accumulation calls prior once per optimizer-step", counts["prior"] == 2, detail)
+
+
+def test_grad_accumulation_grad_clip_boundary():
+    print("\n=== test_grad_accumulation_grad_clip_boundary ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_clip_boundary.txt"
+    text = ("grad accumulation clip boundary contract\n" * 128)
+    clip_calls: list[float] = []
+    clip_max_norm = 0.01
+    x0 = torch.tensor([[41, 43, 45, 47, 49, 51, 53, 55]], dtype=torch.long, device=DEVICE)
+    y0 = torch.tensor([[43, 45, 47, 49, 51, 53, 55, 57]], dtype=torch.long, device=DEVICE)
+    x1 = torch.tensor([[59, 61, 63, 65, 67, 69, 71, 73]], dtype=torch.long, device=DEVICE)
+    y1 = torch.tensor([[61, 63, 65, 67, 69, 71, 73, 75]], dtype=torch.long, device=DEVICE)
+    accum_batches = [(x0, y0), (x1, y1)]
+    ref_batches = [(torch.cat([x0, x1], dim=0), torch.cat([y0, y1], dim=0))]
+    orig_clip = torch.nn.utils.clip_grad_norm_
+
+    def clip_wrapper(parameters, max_norm, *args, **kwargs):
+        total_norm = orig_clip(parameters, max_norm, *args, **kwargs)
+        clip_calls.append(float(total_norm))
+        return total_norm
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.05,
+        lr_end=0.05,
+        zero_boost=1.0,
+        grad_clip=clip_max_norm,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=1,
+        no_save=True,
+        no_interactive=True,
+        prompt="clip boundary",
+        prompt_bytes=10,
+        gen_bytes=0,
+        log_every=1,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        with patch("torch.nn.utils.clip_grad_norm_", side_effect=clip_wrapper):
+            accum_result, accum_calls = _run_train_with_patched_batches(
+                accum_batches,
+                batch_size=1,
+                grad_accum_steps=2,
+                **common,
+            )
+        ref_result, ref_calls = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=2,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    max_diff, worst_name = _model_state_max_abs_diff(accum_result["model"], ref_result["model"])
+    clip_triggered = len(clip_calls) == 1 and clip_calls[0] > clip_max_norm
+    detail = json.dumps(
+        {
+            "accum_calls": accum_calls,
+            "ref_calls": ref_calls,
+            "clip_calls": clip_calls,
+            "max_diff": max_diff,
+            "worst_name": worst_name,
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation clips once after the full micro-batch sum", len(clip_calls) == 1 and accum_calls == 2 and ref_calls == 1, detail)
+    check("grad accumulation clip boundary actually triggers clipping", clip_triggered, detail)
+    check("grad accumulation clip boundary matches one large clipped optimizer-step", max_diff < 1e-6, detail)
+
+
+#====================
+# 21. Grad accumulation metric reporting: console/result metrics must stay on optimizer-step semantics
+#====================
+
+def test_grad_accumulation_metric_reporting_contract():
+    print("\n=== test_grad_accumulation_metric_reporting_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_metric_reporting.txt"
+    text = ("grad accumulation metric reporting contract\n" * 128)
+    x00 = torch.tensor([[5, 8, 11, 14, 17, 20, 23, 26]], dtype=torch.long, device=DEVICE)
+    y00 = torch.tensor([[8, 11, 14, 17, 20, 23, 26, 29]], dtype=torch.long, device=DEVICE)
+    x01 = torch.tensor([[31, 34, 37, 40, 43, 46, 49, 52]], dtype=torch.long, device=DEVICE)
+    y01 = torch.tensor([[34, 37, 40, 43, 46, 49, 52, 55]], dtype=torch.long, device=DEVICE)
+    x10 = torch.tensor([[57, 60, 63, 66, 69, 72, 75, 78]], dtype=torch.long, device=DEVICE)
+    y10 = torch.tensor([[60, 63, 66, 69, 72, 75, 78, 81]], dtype=torch.long, device=DEVICE)
+    x11 = torch.tensor([[83, 86, 89, 92, 95, 98, 101, 104]], dtype=torch.long, device=DEVICE)
+    y11 = torch.tensor([[86, 89, 92, 95, 98, 101, 104, 107]], dtype=torch.long, device=DEVICE)
+    accum_batches = [(x00, y00), (x01, y01), (x10, y10), (x11, y11)]
+    ref_batches = [
+        (torch.cat([x00, x01], dim=0), torch.cat([y00, y01], dim=0)),
+        (torch.cat([x10, x11], dim=0), torch.cat([y10, y11], dim=0)),
+    ]
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.0,
+        lr_end=0.0,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=2,
+        no_save=True,
+        no_interactive=True,
+        prompt="metric report",
+        prompt_bytes=12,
+        gen_bytes=0,
+        log_every=1,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, accum_calls, accum_stdout = _run_train_with_patched_batches(
+            accum_batches,
+            capture_stdout=True,
+            batch_size=1,
+            grad_accum_steps=2,
+            **common,
+        )
+        ref_result, ref_calls, ref_stdout = _run_train_with_patched_batches(
+            ref_batches,
+            capture_stdout=True,
+            batch_size=2,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    accum_steps, accum_epoch = _extract_logged_train_metrics(accum_stdout)
+    ref_steps, ref_epoch = _extract_logged_train_metrics(ref_stdout)
+
+    first_loss_diff = abs(float(accum_result["first_loss"]) - float(ref_result["first_loss"]))
+    last_loss_diff = abs(float(accum_result["last_loss"]) - float(ref_result["last_loss"]))
+    epoch_loss_diff = abs(float(accum_result["last_epoch_train_loss"]) - float(ref_result["last_epoch_train_loss"]))
+    first_bpb_diff = abs(float(accum_result["first_bpb"]) - float(ref_result["first_bpb"]))
+    last_bpb_diff = abs(float(accum_result["last_bpb"]) - float(ref_result["last_bpb"]))
+    epoch_bpb_diff = abs(float(accum_result["last_epoch_train_bpb"]) - float(ref_result["last_epoch_train_bpb"]))
+
+    accum_first_console_ok = (
+        len(accum_steps) == 2
+        and abs(accum_steps[0][0] - float(accum_result["first_loss"])) < 1e-9
+        and abs(accum_steps[0][1] - float(accum_result["first_bpb"])) < 5e-5
+        and abs(accum_steps[0][2] - float(accum_result["first_ppl"])) < 5e-5
+    )
+    accum_last_console_ok = (
+        len(accum_steps) == 2
+        and abs(accum_steps[1][0] - float(accum_result["last_epoch_train_loss"])) < 1e-6
+        and abs(accum_steps[1][1] - float(accum_result["last_epoch_train_bpb"])) < 5e-5
+        and abs(accum_steps[1][2] - float(accum_result["last_epoch_train_ppl"])) < 5e-5
+    )
+    accum_epoch_console_ok = (
+        accum_epoch is not None
+        and abs(accum_epoch[0] - float(accum_result["last_epoch_train_loss"])) < 1e-9
+        and abs(accum_epoch[1] - float(accum_result["last_epoch_train_bpb"])) < 5e-5
+        and abs(accum_epoch[2] - float(accum_result["last_epoch_train_ppl"])) < 5e-5
+    )
+    ref_console_ok = (
+        len(ref_steps) == 2
+        and ref_epoch is not None
+        and _train_metric_rows_close(accum_steps[0], ref_steps[0])
+        and _train_metric_rows_close(accum_steps[1], ref_steps[1])
+        and _train_metric_rows_close(accum_epoch, ref_epoch)
+    )
+
+    check("grad accumulation metric reporting preserves first optimizer-step loss", first_loss_diff < 1e-6, f"diff={first_loss_diff:.3e}")
+    check("grad accumulation metric reporting preserves last optimizer-step loss", last_loss_diff < 1e-6, f"diff={last_loss_diff:.3e}")
+    check("grad accumulation metric reporting preserves epoch train loss", epoch_loss_diff < 1e-6, f"diff={epoch_loss_diff:.3e}")
+    check("grad accumulation metric reporting preserves first optimizer-step BPB", first_bpb_diff < 1e-6, f"diff={first_bpb_diff:.3e}")
+    check("grad accumulation metric reporting preserves last optimizer-step BPB", last_bpb_diff < 1e-6, f"diff={last_bpb_diff:.3e}")
+    check("grad accumulation metric reporting preserves epoch train BPB", epoch_bpb_diff < 1e-6, f"diff={epoch_bpb_diff:.3e}")
+    check("grad accumulation console first-step metrics match result dict", accum_first_console_ok, accum_stdout[-1200:])
+    check("grad accumulation console last-step metrics match result dict", accum_last_console_ok, accum_stdout[-1200:])
+    check("grad accumulation epoch console metrics match result dict", accum_epoch_console_ok, accum_stdout[-1200:])
+    check("grad accumulation console metrics match large-batch reference", ref_console_ok and accum_calls == 4 and ref_calls == 2, f"accum_calls={accum_calls} ref_calls={ref_calls}")
+
+
+def test_grad_accumulation_bpb_contract():
+    print("\n=== test_grad_accumulation_bpb_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_bpb_contract.txt"
+    text = ("grad accumulation weighted bpb contract\n" * 128)
+    x0 = torch.tensor([[7, 7, 7, 7, 7, 7, 7, 7]], dtype=torch.long, device=DEVICE)
+    y0 = torch.tensor([[7, 7, 7, 7, 7, 7, 7, 7]], dtype=torch.long, device=DEVICE)
+    x1 = torch.tensor([
+        [101, 103, 105, 107, 109, 111, 113, 115],
+        [117, 119, 121, 123, 125, 127, 129, 131],
+        [133, 135, 137, 139, 141, 143, 145, 147],
+        [149, 151, 153, 155, 157, 159, 161, 163],
+        [165, 167, 169, 171, 173, 175, 177, 179],
+        [181, 183, 185, 187, 189, 191, 193, 195],
+        [197, 199, 201, 203, 205, 207, 209, 211],
+    ], dtype=torch.long, device=DEVICE)
+    y1 = torch.tensor([
+        [103, 105, 107, 109, 111, 113, 115, 117],
+        [119, 121, 123, 125, 127, 129, 131, 133],
+        [135, 137, 139, 141, 143, 145, 147, 149],
+        [151, 153, 155, 157, 159, 161, 163, 165],
+        [167, 169, 171, 173, 175, 177, 179, 181],
+        [183, 185, 187, 189, 191, 193, 195, 197],
+        [199, 201, 203, 205, 207, 209, 211, 213],
+    ], dtype=torch.long, device=DEVICE)
+    accum_batches = [(x0, y0), (x1, y1)]
+    ref_batches = [(torch.cat([x0, x1], dim=0), torch.cat([y0, y1], dim=0))]
+    micro0_batches = [(x0, y0)]
+    micro1_batches = [(x1, y1)]
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.0,
+        lr_end=0.0,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=1,
+        no_save=True,
+        no_interactive=True,
+        prompt="weighted bpb",
+        prompt_bytes=12,
+        gen_bytes=0,
+        log_every=1,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, _ = _run_train_with_patched_batches(
+            accum_batches,
+            batch_size=1,
+            grad_accum_steps=2,
+            **common,
+        )
+        ref_result, _ = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=8,
+            grad_accum_steps=1,
+            **common,
+        )
+        micro0_result, _ = _run_train_with_patched_batches(
+            micro0_batches,
+            batch_size=1,
+            grad_accum_steps=1,
+            **common,
+        )
+        micro1_result, _ = _run_train_with_patched_batches(
+            micro1_batches,
+            batch_size=7,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    naive_loss = 0.5 * (float(micro0_result["last_epoch_train_loss"]) + float(micro1_result["last_epoch_train_loss"]))
+    naive_bpb = 0.5 * (float(micro0_result["last_epoch_train_bpb"]) + float(micro1_result["last_epoch_train_bpb"]))
+    loss_diff = abs(float(accum_result["last_epoch_train_loss"]) - float(ref_result["last_epoch_train_loss"]))
+    bpb_diff = abs(float(accum_result["last_epoch_train_bpb"]) - float(ref_result["last_epoch_train_bpb"]))
+    naive_loss_gap = abs(float(accum_result["last_epoch_train_loss"]) - naive_loss)
+    naive_bpb_gap = abs(float(accum_result["last_epoch_train_bpb"]) - naive_bpb)
+
+    check("grad accumulation weighted loss matches full concatenated reference", loss_diff < 1e-6, f"diff={loss_diff:.3e}")
+    check("grad accumulation weighted BPB matches full concatenated reference", bpb_diff < 1e-6, f"diff={bpb_diff:.3e}")
+    check("grad accumulation loss is not a naive mean of micro-step losses", naive_loss_gap > 1e-5, f"gap={naive_loss_gap:.3e}")
+    check("grad accumulation BPB is not a naive mean of micro-step BPBs", naive_bpb_gap > 1e-5, f"gap={naive_bpb_gap:.3e}")
+
+
+def test_grad_accumulation_csv_contract():
+    print("\n=== test_grad_accumulation_csv_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_csv_contract.txt"
+    save_root = ROOT / "_tmp_grad_accum_csv_runs"
+    text = ("grad accumulation csv contract\n" * 128)
+    x00 = torch.tensor([[9, 12, 15, 18, 21, 24, 27, 30]], dtype=torch.long, device=DEVICE)
+    y00 = torch.tensor([[12, 15, 18, 21, 24, 27, 30, 33]], dtype=torch.long, device=DEVICE)
+    x01 = torch.tensor([[36, 39, 42, 45, 48, 51, 54, 57]], dtype=torch.long, device=DEVICE)
+    y01 = torch.tensor([[39, 42, 45, 48, 51, 54, 57, 60]], dtype=torch.long, device=DEVICE)
+    x10 = torch.tensor([[63, 66, 69, 72, 75, 78, 81, 84]], dtype=torch.long, device=DEVICE)
+    y10 = torch.tensor([[66, 69, 72, 75, 78, 81, 84, 87]], dtype=torch.long, device=DEVICE)
+    x11 = torch.tensor([[90, 93, 96, 99, 102, 105, 108, 111]], dtype=torch.long, device=DEVICE)
+    y11 = torch.tensor([[93, 96, 99, 102, 105, 108, 111, 114]], dtype=torch.long, device=DEVICE)
+    accum_batches = [(x00, y00), (x01, y01), (x10, y10), (x11, y11)]
+    ref_batches = [
+        (torch.cat([x00, x01], dim=0), torch.cat([y00, y01], dim=0)),
+        (torch.cat([x10, x11], dim=0), torch.cat([y10, y11], dim=0)),
+    ]
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.0,
+        lr_end=0.0,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=2,
+        save_every=999,
+        no_interactive=True,
+        prompt="csv contract",
+        prompt_bytes=12,
+        gen_bytes=0,
+        log_every=1,
+    )
+
+    try:
+        cleanup_tree(save_root)
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, _ = _run_train_with_patched_batches(
+            accum_batches,
+            batch_size=1,
+            grad_accum_steps=2,
+            save_dir=str(save_root),
+            run_name="accum",
+            **common,
+        )
+        ref_result, _ = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=2,
+            grad_accum_steps=1,
+            save_dir=str(save_root),
+            run_name="ref",
+            **common,
+        )
+
+        accum_csv_path = Path(accum_result["run_dir"]) / "metrics.csv"
+        ref_csv_path = Path(ref_result["run_dir"]) / "metrics.csv"
+        accum_row = next(csv.DictReader(accum_csv_path.read_text(encoding="utf-8").splitlines()))
+        ref_row = next(csv.DictReader(ref_csv_path.read_text(encoding="utf-8").splitlines()))
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_root)
+
+    accum_row_ok = (
+        abs(float(accum_row["train_loss"]) - float(accum_result["last_epoch_train_loss"])) < 5e-6
+        and abs(float(accum_row["train_bpb"]) - float(accum_result["last_epoch_train_bpb"])) < 5e-6
+        and abs(float(accum_row["train_ppl"]) - float(accum_result["last_epoch_train_ppl"])) < 5e-6
+    )
+    ref_match_ok = (
+        abs(float(accum_row["train_loss"]) - float(ref_row["train_loss"])) < 5e-6
+        and abs(float(accum_row["train_bpb"]) - float(ref_row["train_bpb"])) < 5e-6
+        and abs(float(accum_row["train_ppl"]) - float(ref_row["train_ppl"])) < 5e-5
+        and abs(float(accum_row["val_loss"]) - float(ref_row["val_loss"])) < 5e-6
+        and abs(float(accum_row["val_bpb"]) - float(ref_row["val_bpb"])) < 5e-6
+        and abs(float(accum_row["val_ppl"]) - float(ref_row["val_ppl"])) < 5e-5
+        and accum_row["lr"] == ref_row["lr"]
+    )
+
+    check("grad accumulation metrics.csv row matches result dict train metrics", accum_row_ok, json.dumps(accum_row, ensure_ascii=False))
+    check("grad accumulation metrics.csv matches large-batch reference metrics", ref_match_ok, json.dumps({"accum": accum_row, "ref": ref_row}, ensure_ascii=False))
+
+
+#====================
+# 24. Grad accumulation schedule/resume: optimizer-step schedule and checkpoint boundaries must stay exact
+#====================
+
+def test_grad_accumulation_schedule_contract():
+    print("\n=== test_grad_accumulation_schedule_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_schedule_contract.txt"
+    text = ("grad accumulation schedule contract\n" * 128)
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        optimizer="sgd",
+        lr_start=0.12,
+        lr_end=0.03,
+        lr_schedule="linear",
+        warmup_steps=2,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        steps=4,
+        no_save=True,
+        no_interactive=True,
+        prompt="sched",
+        prompt_bytes=5,
+        gen_bytes=0,
+        log_every=1,
+        seed=17,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, accum_stdout = _run_train_capture_stdout(
+            batch_size=1,
+            grad_accum_steps=3,
+            **common,
+        )
+        ref_result, ref_stdout = _run_train_capture_stdout(
+            batch_size=3,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    accum_lrs = _extract_logged_step_lrs(accum_stdout)
+    ref_lrs = _extract_logged_step_lrs(ref_stdout)
+    expected_lrs = [
+        f"{lr_with_warmup(common['lr_start'], common['lr_end'], i, common['steps'], warmup_steps=common['warmup_steps'], schedule_fn=lr_linear):.8f}"
+        for i in range(common["steps"])
+    ]
+    detail = json.dumps(
+        {
+            "accum_lrs": accum_lrs,
+            "ref_lrs": ref_lrs,
+            "expected_lrs": expected_lrs,
+            "accum_optimizer_total_steps": accum_result["optimizer_total_steps"],
+            "ref_optimizer_total_steps": ref_result["optimizer_total_steps"],
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation emits one logged LR per optimizer-step", len(accum_lrs) == common["steps"] and accum_result["optimizer_total_steps"] == common["steps"], detail)
+    check("grad accumulation keeps warmup/LR schedule on optimizer-step count", accum_lrs == expected_lrs, detail)
+    check("grad accumulation LR schedule matches large-batch reference", accum_lrs == ref_lrs and ref_result["optimizer_total_steps"] == common["steps"], detail)
+
+
+def test_grad_accumulation_prior_step_contract():
+    print("\n=== test_grad_accumulation_prior_step_contract ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_prior_contract.txt"
+    text = ("grad accumulation prior step contract\n" * 128)
+    prior_calls: list[tuple[float, float, float, float]] = []
+    orig_prior = pyqitnn.QITNNSimplexTransformerLM.apply_qitnn_prior
+
+    def prior_wrapper(self, *args, **kwargs):
+        prior_calls.append(
+            (
+                float(kwargs["step_qk"]),
+                float(kwargs["step_vo"]),
+                float(kwargs["step_ff"]),
+                float(kwargs["entropy_floor"]),
+            )
+        )
+        return orig_prior(self, *args, **kwargs)
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=8,
+        batch_size=1,
+        grad_accum_steps=2,
+        optimizer="sgd",
+        lr_start=0.12,
+        lr_end=0.03,
+        lr_schedule="linear",
+        warmup_steps=2,
+        zero_boost=1.0,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.25,
+        trit_floor_mul_start=2.0,
+        trit_floor_mul_end=0.5,
+        steps=4,
+        no_save=True,
+        no_interactive=True,
+        prompt="prior",
+        prompt_bytes=5,
+        gen_bytes=0,
+        log_every=4,
+        seed=19,
+    )
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        with patch.object(pyqitnn.QITNNSimplexTransformerLM, "apply_qitnn_prior", new=prior_wrapper):
+            result = train(**common)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    expected_calls: list[tuple[float, float, float, float]] = []
+    for step_idx in range(common["steps"]):
+        frac = _schedule_progress(step_idx, common["steps"], common["warmup_steps"])
+        lr_now = lr_with_warmup(
+            common["lr_start"],
+            common["lr_end"],
+            step_idx,
+            common["steps"],
+            warmup_steps=common["warmup_steps"],
+            schedule_fn=lr_linear,
+        )
+        floor_mul = lr_linear(common["trit_floor_mul_start"], common["trit_floor_mul_end"], frac)
+        step_size = lr_now * floor_mul
+        expected_calls.append((step_size, step_size, step_size, common["trit_floor_h"]))
+
+    sequence_ok = (
+        len(prior_calls) == len(expected_calls)
+        and all(
+            abs(actual[0] - expected[0]) < 1e-12
+            and abs(actual[1] - expected[1]) < 1e-12
+            and abs(actual[2] - expected[2]) < 1e-12
+            and abs(actual[3] - expected[3]) < 1e-12
+            for actual, expected in zip(prior_calls, expected_calls)
+        )
+    )
+    detail = json.dumps(
+        {
+            "prior_calls": prior_calls,
+            "expected_calls": expected_calls,
+            "optimizer_total_steps": result["optimizer_total_steps"],
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation applies prior once per optimizer-step", len(prior_calls) == result["optimizer_total_steps"] == common["steps"], detail)
+    check("grad accumulation prior step sizes follow optimizer-step warmup/schedule", sequence_ok, detail)
+
+
+def test_grad_accumulation_resume_exactness_fp32():
+    print("\n=== test_grad_accumulation_resume_exactness_fp32 ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_resume_dataset.txt"
+    save_root = ROOT / "_tmp_grad_accum_resume_runs"
+    run_cont = "grad_accum_resume_cont"
+    run_resumed = "grad_accum_resume_resumed"
+
+    text = (
+        "grad accumulation resume exactness should remain aligned on optimizer-step checkpoint boundaries\n"
+        "the checkpoint resumes only completed optimizer steps and restores rng for the next micro-step sequence\n"
+    ) * 64
+
+    try:
+        cleanup_tree(save_root)
+        tmp_path.write_text(text, encoding="utf-8")
+
+        common = dict(
+            dataset=str(tmp_path),
+            tokenizer="byte",
+            precision_mode="fp32",
+            dim=16,
+            ffn=32,
+            layers=1,
+            seq_len=16,
+            batch_size=1,
+            grad_accum_steps=2,
+            optimizer="adamw",
+            adamw_lr_start=3e-4,
+            adamw_lr_end=3e-5,
+            lr_schedule="linear",
+            warmup_steps=2,
+            epochs=2,
+            steps_per_epoch=2,
+            val_steps=4,
+            save_dir=str(save_root),
+            save_every=1,
+            no_interactive=True,
+            prompt="resume",
+            prompt_bytes=6,
+            gen_bytes=0,
+            log_every=2,
+            seed=79,
+        )
+
+        train(run_name=run_cont, **common)
+        resume_ckpt = save_root / run_cont / "ckpt_ep1.pt"
+        train(run_name=run_resumed, resume=str(resume_ckpt), **common)
+
+        resume_boundary_ckpt = torch.load(str(resume_ckpt), map_location="cpu", weights_only=False)
+        cont_ckpt = torch.load(str(save_root / run_cont / "ckpt_final.pt"), map_location="cpu", weights_only=False)
+        resumed_ckpt = torch.load(str(save_root / run_resumed / "ckpt_final.pt"), map_location="cpu", weights_only=False)
+
+        max_diff = max(
+            (cont_ckpt["model"][name] - resumed_ckpt["model"][name]).abs().max().item()
+            for name in cont_ckpt["model"]
+        )
+        best_val_diff = abs(float(cont_ckpt["best_val_loss"]) - float(resumed_ckpt["best_val_loss"]))
+        step_boundary_ok = resume_boundary_ckpt.get("epoch") == 1 and resume_boundary_ckpt.get("global_step") == 2
+        best_val_epoch_ok = cont_ckpt.get("best_val_epoch") == resumed_ckpt.get("best_val_epoch")
+
+        check("grad accumulation checkpoint keeps optimizer-step global_step at resume boundary", step_boundary_ok, f"epoch={resume_boundary_ckpt.get('epoch')} step={resume_boundary_ckpt.get('global_step')}")
+        check("grad accumulation resume exactness preserves final fp32 model state", max_diff < 1e-9, f"max_diff={max_diff:.3e}")
+        check("grad accumulation resume exactness preserves final global_step", cont_ckpt["global_step"] == resumed_ckpt["global_step"], f"cont={cont_ckpt['global_step']} resumed={resumed_ckpt['global_step']}")
+        check("grad accumulation resume exactness preserves final epoch", cont_ckpt["epoch"] == resumed_ckpt["epoch"], f"cont={cont_ckpt['epoch']} resumed={resumed_ckpt['epoch']}")
+        check("grad accumulation resume exactness preserves best_val_loss", best_val_diff < 1e-12, f"diff={best_val_diff:.3e}")
+        check("grad accumulation resume exactness preserves best_val_epoch metadata", best_val_epoch_ok, f"cont={cont_ckpt.get('best_val_epoch')} resumed={resumed_ckpt.get('best_val_epoch')}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        cleanup_tree(save_root)
+
+
+#====================
+# 25. Grad accumulation large-batch parity: multi-step short runs should stay aligned with the equivalent large batch
+#====================
+
+def test_grad_accumulation_large_batch_parity_fp32():
+    print("\n=== test_grad_accumulation_large_batch_parity_fp32 ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_large_batch_fp32.txt"
+    text = ("grad accumulation fp32 large batch parity\n" * 128)
+    steps = 3
+    seq_len = 12
+    micro_batch_size = 2
+    grad_accum_steps = 2
+    accum_batches, ref_batches = _build_grad_accum_parity_batch_plan(
+        steps=steps,
+        micro_batch_size=micro_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        seq_len=seq_len,
+        offset=41,
+    )
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="fp32",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=seq_len,
+        optimizer="adamw",
+        adamw_lr_start=3e-4,
+        adamw_lr_end=3e-5,
+        lr_schedule="linear",
+        warmup_steps=1,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        trit_floor_mul_start=0.0,
+        trit_floor_mul_end=0.0,
+        steps=steps,
+        val_steps=4,
+        no_save=True,
+        no_interactive=True,
+        prompt="fp32 parity",
+        prompt_bytes=11,
+        gen_bytes=0,
+        log_every=steps,
+        seed=29,
+    )
+
+    probe_offsets = torch.tensor([[173], [191], [209]], dtype=torch.long, device=DEVICE)
+    probe_tokens = (torch.arange(seq_len, dtype=torch.long, device=DEVICE).unsqueeze(0) + probe_offsets) % 251
+    probe_targets = (probe_tokens + 7) % 251
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, accum_calls = _run_train_with_patched_batches(
+            accum_batches,
+            batch_size=micro_batch_size,
+            grad_accum_steps=grad_accum_steps,
+            **common,
+        )
+        ref_result, ref_calls = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=micro_batch_size * grad_accum_steps,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    with torch.no_grad():
+        accum_logits, accum_loss = accum_result["model"](probe_tokens, targets=probe_targets)
+        ref_logits, ref_loss = ref_result["model"](probe_tokens, targets=probe_targets)
+
+    max_diff, worst_name = _model_state_max_abs_diff(accum_result["model"], ref_result["model"])
+    logit_diff = (accum_logits.float() - ref_logits.float()).abs()
+    loss_gap = abs(float(accum_loss.detach().cpu()) - float(ref_loss.detach().cpu()))
+    train_gap = abs(float(accum_result["last_epoch_train_loss"]) - float(ref_result["last_epoch_train_loss"]))
+    val_gap = abs(float(accum_result["last_epoch_val_loss"]) - float(ref_result["last_epoch_val_loss"]))
+    bpb_gap = abs(float(accum_result["last_epoch_train_bpb"]) - float(ref_result["last_epoch_train_bpb"]))
+    detail = json.dumps(
+        {
+            "accum_calls": accum_calls,
+            "ref_calls": ref_calls,
+            "max_diff": max_diff,
+            "worst_name": worst_name,
+            "loss_gap": loss_gap,
+            "train_gap": train_gap,
+            "val_gap": val_gap,
+            "bpb_gap": bpb_gap,
+            "max_logit_gap": float(logit_diff.max().item()),
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation fp32 parity keeps one planned batch per optimizer-step bundle", accum_calls == steps * grad_accum_steps and ref_calls == steps, detail)
+    check("grad accumulation fp32 parity keeps final model state aligned with the equivalent large batch", max_diff < 1e-6, detail)
+    check("grad accumulation fp32 parity keeps train/val loss metrics aligned", train_gap < 1e-6 and val_gap < 5e-6 and bpb_gap < 1e-6, detail)
+    check("grad accumulation fp32 parity keeps probe logits and eval loss aligned", loss_gap < 1e-6 and float(logit_diff.max().item()) < 1e-4, detail)
+
+
+def test_grad_accumulation_large_batch_parity_mixed_smoke():
+    print("\n=== test_grad_accumulation_large_batch_parity_mixed_smoke ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("grad accumulation mixed parity skipped", "bf16 not supported on this GPU")
+        return
+
+    tmp_path = ROOT / "_tmp_grad_accum_large_batch_mixed.txt"
+    text = ("grad accumulation mixed large batch parity\n" * 128)
+    steps = 3
+    seq_len = 12
+    micro_batch_size = 2
+    grad_accum_steps = 2
+    accum_batches, ref_batches = _build_grad_accum_parity_batch_plan(
+        steps=steps,
+        micro_batch_size=micro_batch_size,
+        grad_accum_steps=grad_accum_steps,
+        seq_len=seq_len,
+        offset=37,
+    )
+
+    common = dict(
+        dataset=str(tmp_path),
+        tokenizer="byte",
+        precision_mode="qts_fp32_rest_bf16",
+        dim=16,
+        ffn=32,
+        layers=1,
+        seq_len=seq_len,
+        optimizer="adamw",
+        adamw_lr_start=3e-4,
+        adamw_lr_end=3e-5,
+        lr_schedule="linear",
+        warmup_steps=1,
+        grad_clip=0.0,
+        ent_lambda=0.0,
+        trit_floor_h=0.0,
+        trit_floor_mul_start=0.0,
+        trit_floor_mul_end=0.0,
+        steps=steps,
+        val_steps=4,
+        no_save=True,
+        no_interactive=True,
+        prompt="mixed parity",
+        prompt_bytes=12,
+        gen_bytes=0,
+        log_every=steps,
+        seed=31,
+    )
+
+    probe_offsets = torch.tensor([[149], [173]], dtype=torch.long, device=DEVICE)
+    probe_tokens = (torch.arange(seq_len, dtype=torch.long, device=DEVICE).unsqueeze(0) + probe_offsets) % 251
+    probe_targets = (probe_tokens + 9) % 251
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        accum_result, accum_calls = _run_train_with_patched_batches(
+            accum_batches,
+            batch_size=micro_batch_size,
+            grad_accum_steps=grad_accum_steps,
+            **common,
+        )
+        ref_result, ref_calls = _run_train_with_patched_batches(
+            ref_batches,
+            batch_size=micro_batch_size * grad_accum_steps,
+            grad_accum_steps=1,
+            **common,
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            accum_logits, accum_loss = accum_result["model"](probe_tokens, targets=probe_targets)
+            ref_logits, ref_loss = ref_result["model"](probe_tokens, targets=probe_targets)
+
+    logit_diff = (accum_logits.float() - ref_logits.float()).abs()
+    state_gap, worst_name = _model_state_max_abs_diff(accum_result["model"], ref_result["model"])
+    eval_loss_gap = abs(float(accum_loss.detach().cpu()) - float(ref_loss.detach().cpu()))
+    train_gap = abs(float(accum_result["last_epoch_train_loss"]) - float(ref_result["last_epoch_train_loss"]))
+    val_gap = abs(float(accum_result["last_epoch_val_loss"]) - float(ref_result["last_epoch_val_loss"]))
+    finite_ok = (
+        math.isfinite(float(accum_result["last_epoch_train_loss"]))
+        and math.isfinite(float(ref_result["last_epoch_train_loss"]))
+        and math.isfinite(float(accum_loss.detach().cpu()))
+        and math.isfinite(float(ref_loss.detach().cpu()))
+        and torch.isfinite(accum_logits.float()).all().item()
+        and torch.isfinite(ref_logits.float()).all().item()
+    )
+    dtype_ok = (
+        accum_logits.dtype == torch.bfloat16
+        and ref_logits.dtype == torch.bfloat16
+        and accum_loss.dtype == torch.float32
+        and ref_loss.dtype == torch.float32
+    )
+    stats_accum = pyqitnn.qitnn_diag_stats(
+        accum_result["model"].blocks[0].q_proj.a_neg,
+        accum_result["model"].blocks[0].q_proj.a_zero,
+        accum_result["model"].blocks[0].q_proj.a_pos,
+    )
+    stats_ref = pyqitnn.qitnn_diag_stats(
+        ref_result["model"].blocks[0].q_proj.a_neg,
+        ref_result["model"].blocks[0].q_proj.a_zero,
+        ref_result["model"].blocks[0].q_proj.a_pos,
+    )
+    diag_gap = max(
+        abs(stats_accum["p_neg"] - stats_ref["p_neg"]),
+        abs(stats_accum["p_zero"] - stats_ref["p_zero"]),
+        abs(stats_accum["p_pos"] - stats_ref["p_pos"]),
+        abs(stats_accum["h"] - stats_ref["h"]),
+    )
+    detail = json.dumps(
+        {
+            "accum_calls": accum_calls,
+            "ref_calls": ref_calls,
+            "eval_loss_gap": eval_loss_gap,
+            "train_gap": train_gap,
+            "val_gap": val_gap,
+            "mean_logit_gap": float(logit_diff.mean().item()),
+            "max_logit_gap": float(logit_diff.max().item()),
+            "diag_gap": diag_gap,
+            "state_gap": state_gap,
+            "worst_name": worst_name,
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation mixed parity keeps mixed visible dtype pinned to bf16", dtype_ok, detail)
+    check("grad accumulation mixed parity keeps both runs finite", finite_ok, detail)
+    check("grad accumulation mixed parity keeps optimizer-step batch plan intact", accum_calls == steps * grad_accum_steps and ref_calls == steps, detail)
+    check("grad accumulation mixed parity keeps train/eval losses close to the equivalent large batch", train_gap < 0.002 and val_gap < 0.01 and eval_loss_gap < 0.01, detail)
+    check("grad accumulation mixed parity keeps logits and QTS diagnostics close to the equivalent large batch", float(logit_diff.mean().item()) < 0.06 and float(logit_diff.max().item()) < 0.40 and diag_gap < 0.01 and state_gap < 0.01, detail)
+
+
+def test_grad_accumulation_finite_grads_smoke():
+    print("\n=== test_grad_accumulation_finite_grads_smoke ===")
+
+    tmp_path = ROOT / "_tmp_grad_accum_finite_grads.txt"
+    text = ("grad accumulation finite grads smoke\n" * 128)
+    grad_checks: list[tuple[bool, int, float]] = []
+    orig_step = torch.optim.AdamW.step
+    precision_mode = "qts_fp32_rest_bf16" if torch.cuda.is_bf16_supported() else "fp32"
+
+    def step_wrapper(self, *args, **kwargs):
+        finite = True
+        seen = 0
+        max_abs = 0.0
+        for group in self.param_groups:
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                grad = param.grad.detach()
+                seen += 1
+                finite = finite and bool(torch.isfinite(grad).all().item())
+                max_abs = max(max_abs, float(grad.abs().max().item()))
+        grad_checks.append((finite, seen, max_abs))
+        return orig_step(self, *args, **kwargs)
+
+    try:
+        tmp_path.write_text(text, encoding="utf-8")
+        with patch.object(torch.optim.AdamW, "step", new=step_wrapper):
+            result = train(
+                dataset=str(tmp_path),
+                tokenizer="byte",
+                precision_mode=precision_mode,
+                dim=24,
+                ffn=48,
+                layers=2,
+                seq_len=12,
+                batch_size=1,
+                grad_accum_steps=4,
+                optimizer="adamw",
+                adamw_lr_start=3e-4,
+                adamw_lr_end=3e-5,
+                lr_schedule="cosine",
+                warmup_steps=1,
+                grad_clip=0.0,
+                ent_lambda=0.0,
+                trit_floor_h=0.0,
+                trit_floor_mul_start=0.0,
+                trit_floor_mul_end=0.0,
+                steps=3,
+                val_steps=4,
+                no_save=True,
+                no_interactive=True,
+                prompt="finite grads",
+                prompt_bytes=12,
+                gen_bytes=0,
+                log_every=3,
+                seed=41,
+            )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    grad_ok = (
+        len(grad_checks) == result["optimizer_total_steps"]
+        and all(finite and seen > 0 and max_abs > 0.0 for finite, seen, max_abs in grad_checks)
+    )
+    finite_losses = (
+        math.isfinite(float(result["first_loss"]))
+        and math.isfinite(float(result["last_loss"]))
+        and math.isfinite(float(result["last_epoch_train_loss"]))
+        and math.isfinite(float(result["last_epoch_val_loss"]))
+    )
+    detail = json.dumps(
+        {
+            "precision_mode": precision_mode,
+            "optimizer_total_steps": result["optimizer_total_steps"],
+            "grad_checks": grad_checks,
+            "first_loss": result["first_loss"],
+            "last_loss": result["last_loss"],
+            "last_epoch_train_loss": result["last_epoch_train_loss"],
+            "last_epoch_val_loss": result["last_epoch_val_loss"],
+        },
+        ensure_ascii=False,
+    )
+
+    check("grad accumulation finite-grad smoke sees one finite gradient set per optimizer-step", grad_ok, detail)
+    check("grad accumulation finite-grad smoke keeps train/val losses finite", finite_losses, detail)
+
+
+#====================
+# 26. Warmup contract: scheduler warmup must be explicit, reversible, and CLI-addressable
 #====================
 
 def test_warmup_schedule_contract():
@@ -2563,6 +4678,11 @@ if __name__ == "__main__":
     test_full_model_gradient_flow()
     test_overfit_single_batch()
     test_checkpoint_roundtrip()
+    test_rng_state_helper_roundtrip()
+    test_checkpoint_payload_includes_rng_state()
+    test_checkpoint_load_legacy_payload_without_rng_state()
+    test_checkpoint_resume_restores_batch_rng_exact_fp32()
+    test_checkpoint_restore_preserves_generation_rng()
     test_extreme_amplitude_scales()
     test_qitnn_linear_simplex_consistency()
     test_adamw_param_groups()
@@ -2574,7 +4694,31 @@ if __name__ == "__main__":
     test_qitnn_linear_mixed_precision_forces_bf16()
     test_model_mixed_precision_smoke()
     test_mixed_precision_cli_defaults()
+    test_precision_mode_single_source_of_truth()
+    test_legacy_mixed_precision_python_compat()
+    test_cli_help_prefers_precision_mode()
+    test_precision_config_artifact_prefers_canonical_mode()
+    test_diagnostics_schema_contract()
+    test_trainer_writes_diag_json()
+    test_trainer_writes_diag_csv()
+    test_trainer_writes_diag_artifacts_under_mixed_multilayer_stress()
+    test_diag_artifacts_resume_same_run_prunes_future_epochs()
     test_sample_batch_contract()
+    test_grad_accumulation_config_contract()
+    test_grad_accumulation_cli_contract()
+    test_grad_accumulation_step_semantics_contract()
+    test_grad_accumulation_loss_scaling_contract()
+    test_grad_accumulation_optimizer_step_count_contract()
+    test_grad_accumulation_grad_clip_boundary()
+    test_grad_accumulation_metric_reporting_contract()
+    test_grad_accumulation_bpb_contract()
+    test_grad_accumulation_csv_contract()
+    test_grad_accumulation_schedule_contract()
+    test_grad_accumulation_prior_step_contract()
+    test_grad_accumulation_resume_exactness_fp32()
+    test_grad_accumulation_large_batch_parity_fp32()
+    test_grad_accumulation_large_batch_parity_mixed_smoke()
+    test_grad_accumulation_finite_grads_smoke()
     test_warmup_schedule_contract()
     test_warmup_trainer_csv_smoke()
     test_warmup_resume_schedule_smoke()

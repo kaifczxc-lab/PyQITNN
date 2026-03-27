@@ -3,38 +3,8 @@ from __future__ import annotations
 import torch
 
 from .bridge import load_native
-
-_PRECISION_MODE_ALIASES = {
-    "mixed_bf16_native": "qts_fp32_rest_bf16",
-    "bf16": "qts_fp32_rest_bf16",
-}
-_PRECISION_MODE_SET = {"fp32", "qts_fp32_rest_bf16"}
-
-
-def _normalize_precision_mode(value: str) -> str:
-    mode = value.strip().lower()
-    mode = _PRECISION_MODE_ALIASES.get(mode, mode)
-    if mode not in _PRECISION_MODE_SET:
-        wanted = ", ".join(sorted(_PRECISION_MODE_SET))
-        raise RuntimeError(f"precision_mode must be one of: {wanted}")
-    return mode
-
-
-def _resolve_precision_mode_args(
-    precision_mode: str | None,
-    mixed_precision: bool | None,
-) -> tuple[str, bool]:
-    mode = "fp32" if precision_mode is None else _normalize_precision_mode(str(precision_mode))
-    if mixed_precision is not None:
-        legacy_mode = "qts_fp32_rest_bf16" if bool(mixed_precision) else "fp32"
-        if precision_mode is None:
-            mode = legacy_mode
-        elif legacy_mode != mode:
-            raise RuntimeError(
-                "mixed_precision and precision_mode conflict. "
-                "Use precision_mode alone, or keep them aligned during migration."
-            )
-    return mode, mode != "fp32"
+from .precision import normalize_precision_mode as _normalize_precision_mode
+from .precision import resolve_precision_mode as _resolve_precision_mode_args
 
 
 #====================

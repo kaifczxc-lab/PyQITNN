@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyqitnn"
-version = "0.3.9"
+version = "0.4.0"
 description = "Quantum-inspired ternary neural network layers for PyTorch"
 readme = "README.md"
 license = {text = "Apache-2.0"}
