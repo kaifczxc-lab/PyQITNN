@@ -96,6 +96,103 @@ __global__ void qitnn_cast_from_float_k(const float* src, DstT* dst, int n) {
     }
 }
 
+__global__ void qitnn_forward3_packed_epilogue_k(
+    const float* packed_out,
+    float* out_u,
+    float* out_v,
+    float* out_cn,
+    float* out_cz,
+    float* out_cp,
+    int count
+) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= count) {
+        return;
+    }
+
+    int base = i * 3;
+    float a = packed_out[base + 0];
+    float b = packed_out[base + 1];
+    float c = packed_out[base + 2];
+    float a2 = a * a;
+    float b2 = b * b;
+    float c2 = c * c;
+    float z = a2 + b2 + c2;
+    float inv_z = (z > 1e-12f) ? (1.0f / z) : 0.0f;
+
+    out_cn[i] = a;
+    out_cz[i] = b;
+    out_cp[i] = c;
+    out_u[i] = (c2 - a2) * inv_z;
+    out_v[i] = b2 * inv_z;
+}
+
+__global__ void qitnn_backward3_packed_input_k(
+    const float* dcn,
+    const float* dcz,
+    const float* dcp,
+    const float* a_packed,
+    float* out_input_grad,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    int count = rows * in_dim;
+    if (i >= count) {
+        return;
+    }
+
+    int row = i / in_dim;
+    int in_idx = i - (row * in_dim);
+    int grad_base = row * out_dim;
+    int weight_base = (in_idx * out_dim) * 3;
+    float acc = 0.0f;
+    for (int out_idx = 0; out_idx < out_dim; ++out_idx) {
+        int grad_idx = grad_base + out_idx;
+        int packed_idx = weight_base + (out_idx * 3);
+        acc += dcn[grad_idx] * a_packed[packed_idx + 0];
+        acc += dcz[grad_idx] * a_packed[packed_idx + 1];
+        acc += dcp[grad_idx] * a_packed[packed_idx + 2];
+    }
+    out_input_grad[i] = acc;
+}
+
+__global__ void qitnn_backward3_packed_weight_k(
+    const float* input,
+    const float* dcn,
+    const float* dcz,
+    const float* dcp,
+    float* out_a_packed_grad,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    int i = blockIdx.x * 256 + threadIdx.x;
+    int count = in_dim * out_dim;
+    if (i >= count) {
+        return;
+    }
+
+    int in_idx = i / out_dim;
+    int out_idx = i - (in_idx * out_dim);
+    float acc_n = 0.0f;
+    float acc_z = 0.0f;
+    float acc_p = 0.0f;
+    for (int row = 0; row < rows; ++row) {
+        float x = input[(row * in_dim) + in_idx];
+        int grad_idx = (row * out_dim) + out_idx;
+        acc_n += x * dcn[grad_idx];
+        acc_z += x * dcz[grad_idx];
+        acc_p += x * dcp[grad_idx];
+    }
+
+    int packed_base = i * 3;
+    out_a_packed_grad[packed_base + 0] = acc_n;
+    out_a_packed_grad[packed_base + 1] = acc_z;
+    out_a_packed_grad[packed_base + 2] = acc_p;
+}
+
 void qitnn_report(cudaError_t err, const char* op, int line) {
     if (err == cudaSuccess) {
         return;
@@ -104,7 +201,7 @@ void qitnn_report(cudaError_t err, const char* op, int line) {
     const char* msg = cudaGetErrorString(err);
     std::fprintf(
         stderr,
-        "[libQITNN] %s failed at line %d: err=%d (%s) %s\n",
+        "[PyQITNN] %s failed at line %d: err=%d (%s) %s\n",
         op,
         line,
         (int)err,
@@ -135,7 +232,7 @@ bool qitnn_report_cublas(cublasStatus_t status, const char* op, int line) {
     }
     std::fprintf(
         stderr,
-        "[libQITNN] %s failed at line %d: status=%d (%s)\n",
+        "[PyQITNN] %s failed at line %d: status=%d (%s)\n",
         op,
         line,
         (int)status,
@@ -298,7 +395,7 @@ void qitnn_cast_to_float(const void* src, int dtype, float* dst, int count) {
             QITNN_CU(cudaGetLastError());
             break;
         default:
-            std::fprintf(stderr, "[libQITNN] unsupported dtype code for qitnn_cast_to_float: %d\n", dtype);
+            std::fprintf(stderr, "[PyQITNN] unsupported dtype code for qitnn_cast_to_float: %d\n", dtype);
             break;
     }
 }
@@ -324,7 +421,7 @@ void qitnn_cast_from_float(const float* src, int dtype, void* dst, int count) {
             QITNN_CU(cudaGetLastError());
             break;
         default:
-            std::fprintf(stderr, "[libQITNN] unsupported dtype code for qitnn_cast_from_float: %d\n", dtype);
+            std::fprintf(stderr, "[PyQITNN] unsupported dtype code for qitnn_cast_from_float: %d\n", dtype);
             break;
     }
 }
@@ -723,6 +820,103 @@ __global__ void qitnn_attn_apply2_k(
     oy[idx] = sy;
 }
 
+__device__ inline float qitnn_warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
+__device__ inline float qitnn_block_sum_256(float value, float* warp_sums) {
+    int lane = threadIdx.x & 31;
+    int warp = threadIdx.x >> 5;
+
+    value = qitnn_warp_sum(value);
+    if (lane == 0) {
+        warp_sums[warp] = value;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        float block = (lane < 8) ? warp_sums[lane] : 0.0f;
+        block = qitnn_warp_sum(block);
+        if (lane == 0) {
+            warp_sums[0] = block;
+        }
+    }
+    __syncthreads();
+    return warp_sums[0];
+}
+
+static inline bool qitnn_use_streaming_attention(int seq_len, int dim) {
+    return seq_len > 512 && dim <= 256;
+}
+
+__global__ void qitnn_attn_streaming2_k(
+    const float* qx,
+    const float* qy,
+    const float* kx,
+    const float* ky,
+    const float* vx,
+    const float* vy,
+    float* ox,
+    float* oy,
+    int seq_len,
+    int dim,
+    float scale
+) {
+    __shared__ float warp_sums[8];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    if (row >= seq_len || tid >= 256) {
+        return;
+    }
+
+    float qx_i = 0.0f;
+    float qy_i = 0.0f;
+    float acc_x = 0.0f;
+    float acc_y = 0.0f;
+    if (tid < dim) {
+        qx_i = qx[row * dim + tid];
+        qy_i = qy[row * dim + tid];
+    }
+
+    float row_max = 0.0f;
+    float row_sum = 0.0f;
+    for (int col = 0; col <= row; ++col) {
+        float local = 0.0f;
+        if (tid < dim) {
+            local = (qx_i * kx[col * dim + tid]) + (qy_i * ky[col * dim + tid]);
+        }
+        float score = qitnn_block_sum_256(local, warp_sums) * scale;
+        if (col == 0) {
+            row_max = score;
+            row_sum = 1.0f;
+            if (tid < dim) {
+                acc_x = vx[col * dim + tid];
+                acc_y = vy[col * dim + tid];
+            }
+        } else {
+            float next_max = fmaxf(row_max, score);
+            float alpha = expf(row_max - next_max);
+            float beta = expf(score - next_max);
+            row_sum = (row_sum * alpha) + beta;
+            if (tid < dim) {
+                acc_x = (acc_x * alpha) + (beta * vx[col * dim + tid]);
+                acc_y = (acc_y * alpha) + (beta * vy[col * dim + tid]);
+            }
+            row_max = next_max;
+        }
+    }
+
+    if (tid < dim) {
+        float inv = (row_sum > 1e-20f) ? (1.0f / row_sum) : 0.0f;
+        ox[row * dim + tid] = acc_x * inv;
+        oy[row * dim + tid] = acc_y * inv;
+    }
+}
+
 __global__ void qitnn_attn_dv2_k(
     const float* attn,
     const float* dox,
@@ -789,6 +983,47 @@ __global__ void qitnn_attn_dscores2_k(
     }
     for (int j = 0; j < seq_len; ++j) {
         d_scores[i * seq_len + j] = (j <= i) ? (attn[i * seq_len + j] * (d_attn[i * seq_len + j] - dot) * scale) : 0.0f;
+    }
+}
+
+__global__ void qitnn_attn_dscores2_recompute_k(
+    const float* attn,
+    const float* dox,
+    const float* doy,
+    const float* vx,
+    const float* vy,
+    float* d_scores,
+    int seq_len,
+    int dim,
+    float scale
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= seq_len) {
+        return;
+    }
+
+    float dot = 0.0f;
+    for (int j = 0; j <= i; ++j) {
+        float d_attn = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            d_attn += dox[i * dim + d] * vx[j * dim + d];
+            d_attn += doy[i * dim + d] * vy[j * dim + d];
+        }
+        dot += attn[i * seq_len + j] * d_attn;
+    }
+
+    for (int j = 0; j < seq_len; ++j) {
+        int idx = (i * seq_len) + j;
+        if (j > i) {
+            d_scores[idx] = 0.0f;
+            continue;
+        }
+        float d_attn = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            d_attn += dox[i * dim + d] * vx[j * dim + d];
+            d_attn += doy[i * dim + d] * vy[j * dim + d];
+        }
+        d_scores[idx] = attn[idx] * (d_attn - dot) * scale;
     }
 }
 
@@ -939,6 +1174,83 @@ __global__ void qitnn_attn_apply2_batched_k(
     oy[idx] = sy;
 }
 
+__global__ void qitnn_attn_streaming2_batched_k(
+    const float* qx,
+    const float* qy,
+    const float* kx,
+    const float* ky,
+    const float* vx,
+    const float* vy,
+    float* ox,
+    float* oy,
+    int batch,
+    int seq_len,
+    int dim,
+    float scale
+) {
+    __shared__ float warp_sums[8];
+
+    int row = blockIdx.x;
+    int b = blockIdx.y;
+    int tid = threadIdx.x;
+    if (b >= batch || row >= seq_len || tid >= 256) {
+        return;
+    }
+
+    int base = b * seq_len * dim;
+    const float* qx_b = qx + base;
+    const float* qy_b = qy + base;
+    const float* kx_b = kx + base;
+    const float* ky_b = ky + base;
+    const float* vx_b = vx + base;
+    const float* vy_b = vy + base;
+    float* ox_b = ox + base;
+    float* oy_b = oy + base;
+
+    float qx_i = 0.0f;
+    float qy_i = 0.0f;
+    float acc_x = 0.0f;
+    float acc_y = 0.0f;
+    if (tid < dim) {
+        qx_i = qx_b[row * dim + tid];
+        qy_i = qy_b[row * dim + tid];
+    }
+
+    float row_max = 0.0f;
+    float row_sum = 0.0f;
+    for (int col = 0; col <= row; ++col) {
+        float local = 0.0f;
+        if (tid < dim) {
+            local = (qx_i * kx_b[col * dim + tid]) + (qy_i * ky_b[col * dim + tid]);
+        }
+        float score = qitnn_block_sum_256(local, warp_sums) * scale;
+        if (col == 0) {
+            row_max = score;
+            row_sum = 1.0f;
+            if (tid < dim) {
+                acc_x = vx_b[col * dim + tid];
+                acc_y = vy_b[col * dim + tid];
+            }
+        } else {
+            float next_max = fmaxf(row_max, score);
+            float alpha = expf(row_max - next_max);
+            float beta = expf(score - next_max);
+            row_sum = (row_sum * alpha) + beta;
+            if (tid < dim) {
+                acc_x = (acc_x * alpha) + (beta * vx_b[col * dim + tid]);
+                acc_y = (acc_y * alpha) + (beta * vy_b[col * dim + tid]);
+            }
+            row_max = next_max;
+        }
+    }
+
+    if (tid < dim) {
+        float inv = (row_sum > 1e-20f) ? (1.0f / row_sum) : 0.0f;
+        ox_b[row * dim + tid] = acc_x * inv;
+        oy_b[row * dim + tid] = acc_y * inv;
+    }
+}
+
 __global__ void qitnn_attn_dv2_batched_k(
     const float* attn,
     const float* dox,
@@ -1022,6 +1334,54 @@ __global__ void qitnn_attn_dscores2_batched_k(
     }
     for (int j = 0; j < seq_len; ++j) {
         d_scores[row_base + j] = (j <= i) ? (attn[row_base + j] * (d_attn[row_base + j] - dot) * scale) : 0.0f;
+    }
+}
+
+__global__ void qitnn_attn_dscores2_recompute_batched_k(
+    const float* attn,
+    const float* dox,
+    const float* doy,
+    const float* vx,
+    const float* vy,
+    float* d_scores,
+    int batch,
+    int seq_len,
+    int dim,
+    float scale
+) {
+    int row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_rows = batch * seq_len;
+    if (row_idx >= total_rows) {
+        return;
+    }
+
+    int b = row_idx / seq_len;
+    int i = row_idx % seq_len;
+    int attn_base = b * seq_len * seq_len;
+    int vec_base = b * seq_len * dim;
+
+    float dot = 0.0f;
+    for (int j = 0; j <= i; ++j) {
+        float d_attn = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            d_attn += dox[vec_base + i * dim + d] * vx[vec_base + j * dim + d];
+            d_attn += doy[vec_base + i * dim + d] * vy[vec_base + j * dim + d];
+        }
+        dot += attn[attn_base + i * seq_len + j] * d_attn;
+    }
+
+    for (int j = 0; j < seq_len; ++j) {
+        int idx = attn_base + (i * seq_len) + j;
+        if (j > i) {
+            d_scores[idx] = 0.0f;
+            continue;
+        }
+        float d_attn = 0.0f;
+        for (int d = 0; d < dim; ++d) {
+            d_attn += dox[vec_base + i * dim + d] * vx[vec_base + j * dim + d];
+            d_attn += doy[vec_base + i * dim + d] * vy[vec_base + j * dim + d];
+        }
+        d_scores[idx] = attn[idx] * (d_attn - dot) * scale;
     }
 }
 
@@ -1191,7 +1551,6 @@ extern "C" QITNN_API void Qitnn_SyncDown(float* host, int count) {
     if (slot.bytes < bytes) {
         bytes = slot.bytes;
     }
-    QITNN_CU(cudaDeviceSynchronize());
     QITNN_CU(cudaMemcpy(host, slot.dev, bytes, cudaMemcpyDeviceToHost));
 }
 
@@ -1228,7 +1587,6 @@ extern "C" QITNN_API void Qitnn_Copy(float* dst, float* src, int count) {
 
     if (src_pinned) {
         DeviceSlot src_slot = qitnn_lookup_slot(src);
-        QITNN_CU(cudaDeviceSynchronize());
         QITNN_CU(cudaMemcpy(dst, src_slot.dev, bytes, cudaMemcpyDeviceToHost));
         return;
     }
@@ -1563,29 +1921,45 @@ extern "C" QITNN_API void Qitnn_Attention2(
     float* d_ox = (float*)qitnn_dev(ox, sz_vec, false);
     float* d_oy = (float*)qitnn_dev(oy, sz_vec, false);
 
-    /* scores buffer hangs around. boring but useful. */
-    qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        qitnn_attn_streaming2_k<<<seq_len, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            seq_len,
+            dim,
+            scale
+        );
+    } else {
+        /* scores buffer hangs around. boring but useful. */
+        qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
 
-    qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
-        d_qx,
-        d_qy,
-        d_kx,
-        d_ky,
-        g_scores,
-        seq_len,
-        dim,
-        scale
-    );
-    qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(g_scores, seq_len);
-    qitnn_attn_apply2_k<<<((seq_len * dim) + 255) / 256, 256>>>(
-        g_scores,
-        d_vx,
-        d_vy,
-        d_ox,
-        d_oy,
-        seq_len,
-        dim
-    );
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            g_scores,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(g_scores, seq_len);
+        qitnn_attn_apply2_k<<<((seq_len * dim) + 255) / 256, 256>>>(
+            g_scores,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            seq_len,
+            dim
+        );
+    }
     QITNN_CU(cudaGetLastError());
 
     if (!stay) {
@@ -1644,30 +2018,66 @@ extern "C" QITNN_API void Qitnn_AttentionBackward2(
     float* d_dox = (float*)qitnn_dev(dox, sz_vec, true);
     float* d_doy = (float*)qitnn_dev(doy, sz_vec, true);
 
-    float* d_attn = nullptr;
-    float* d_tmp_attn = nullptr;
-    float* d_scores = nullptr;
-    QITNN_CU(cudaMalloc(&d_attn, sz_scores));
-    QITNN_CU(cudaMalloc(&d_tmp_attn, sz_scores));
-    QITNN_CU(cudaMalloc(&d_scores, sz_scores));
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        float* d_attn = nullptr;
+        float* d_scores = nullptr;
+        QITNN_CU(cudaMalloc(&d_attn, sz_scores));
+        QITNN_CU(cudaMalloc(&d_scores, sz_scores));
 
-    qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_qx, d_qy, d_kx, d_ky, d_attn, seq_len, dim, scale);
-    qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
-    qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, ddvx, ddvy, seq_len, dim);
-    qitnn_attn_dattn2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_dox, d_doy, d_vx, d_vy, d_tmp_attn, seq_len, dim);
-    qitnn_attn_dscores2_k<<<(seq_len + 255) / 256, 256>>>(d_attn, d_tmp_attn, d_scores, seq_len, scale);
-    qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, ddqx, ddqy, seq_len, dim);
-    qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, ddkx, ddky, seq_len, dim);
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            d_attn,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
+        qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, ddvx, ddvy, seq_len, dim);
+        qitnn_attn_dscores2_recompute_k<<<(seq_len + 255) / 256, 256>>>(
+            d_attn,
+            d_dox,
+            d_doy,
+            d_vx,
+            d_vy,
+            d_scores,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, ddqx, ddqy, seq_len, dim);
+        qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, ddkx, ddky, seq_len, dim);
+
+        QITNN_CU(cudaFree(d_attn));
+        QITNN_CU(cudaFree(d_scores));
+    } else {
+        float* d_attn = nullptr;
+        float* d_tmp_attn = nullptr;
+        float* d_scores = nullptr;
+        QITNN_CU(cudaMalloc(&d_attn, sz_scores));
+        QITNN_CU(cudaMalloc(&d_tmp_attn, sz_scores));
+        QITNN_CU(cudaMalloc(&d_scores, sz_scores));
+
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_qx, d_qy, d_kx, d_ky, d_attn, seq_len, dim, scale);
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
+        qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, ddvx, ddvy, seq_len, dim);
+        qitnn_attn_dattn2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_dox, d_doy, d_vx, d_vy, d_tmp_attn, seq_len, dim);
+        qitnn_attn_dscores2_k<<<(seq_len + 255) / 256, 256>>>(d_attn, d_tmp_attn, d_scores, seq_len, scale);
+        qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, ddqx, ddqy, seq_len, dim);
+        qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, ddkx, ddky, seq_len, dim);
+
+        QITNN_CU(cudaFree(d_attn));
+        QITNN_CU(cudaFree(d_tmp_attn));
+        QITNN_CU(cudaFree(d_scores));
+    }
     QITNN_CU(cudaGetLastError());
     QITNN_CU(cudaDeviceSynchronize());
 
     if (!stay) {
         QITNN_CU(cudaDeviceSynchronize());
     }
-
-    QITNN_CU(cudaFree(d_attn));
-    QITNN_CU(cudaFree(d_tmp_attn));
-    QITNN_CU(cudaFree(d_scores));
 
     qitnn_undev(dqx, ddqx, sz_vec, true);
     qitnn_undev(dqy, ddqy, sz_vec, true);
@@ -1700,7 +2110,6 @@ extern "C" QITNN_API double Qitnn_CELoss(float* logits, float* targets, int seq_
 
     qitnn_celoss_rows_k<<<(seq_len + 255) / 256, 256>>>(d_logits, d_targets, g_loss, seq_len, vocab);
     QITNN_CU(cudaGetLastError());
-    QITNN_CU(cudaDeviceSynchronize());
 
     std::vector<float> host_loss(seq_len, 0.0f);
     QITNN_CU(cudaMemcpy(host_loss.data(), g_loss, sz_loss, cudaMemcpyDeviceToHost));
@@ -1830,28 +2239,44 @@ extern "C" QITNN_API void Qitnn_DeviceAttention2(
 
     float scale = 1.0f / sqrtf(2.0f * (float)dim);
     size_t sz_scores = (size_t)seq_len * seq_len * sizeof(float);
-    qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        qitnn_attn_streaming2_k<<<seq_len, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            seq_len,
+            dim,
+            scale
+        );
+    } else {
+        qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
 
-    qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
-        d_qx,
-        d_qy,
-        d_kx,
-        d_ky,
-        g_scores,
-        seq_len,
-        dim,
-        scale
-    );
-    qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(g_scores, seq_len);
-    qitnn_attn_apply2_k<<<((seq_len * dim) + 255) / 256, 256>>>(
-        g_scores,
-        d_vx,
-        d_vy,
-        d_ox,
-        d_oy,
-        seq_len,
-        dim
-    );
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            g_scores,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(g_scores, seq_len);
+        qitnn_attn_apply2_k<<<((seq_len * dim) + 255) / 256, 256>>>(
+            g_scores,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            seq_len,
+            dim
+        );
+    }
     QITNN_CU(cudaGetLastError());
 }
 
@@ -1877,34 +2302,52 @@ extern "C" QITNN_API void Qitnn_DeviceAttention2Batched(
 
     float scale = 1.0f / sqrtf(2.0f * (float)dim);
     size_t sz_scores = (size_t)batch * seq_len * seq_len * sizeof(float);
-    qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        dim3 grid(seq_len, batch);
+        qitnn_attn_streaming2_batched_k<<<grid, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            batch,
+            seq_len,
+            dim,
+            scale
+        );
+    } else {
+        qitnn_ensure_buffer(g_scores, g_scores_cap, sz_scores);
 
-    const int total_scores = batch * seq_len * seq_len;
-    const int total_rows = batch * seq_len;
-    const int total_values = batch * seq_len * dim;
+        const int total_scores = batch * seq_len * seq_len;
+        const int total_rows = batch * seq_len;
+        const int total_values = batch * seq_len * dim;
 
-    qitnn_attn_scores2_batched_k<<<(total_scores + 255) / 256, 256>>>(
-        d_qx,
-        d_qy,
-        d_kx,
-        d_ky,
-        g_scores,
-        batch,
-        seq_len,
-        dim,
-        scale
-    );
-    qitnn_attn_softmax_rows_batched_k<<<(total_rows + 255) / 256, 256>>>(g_scores, batch, seq_len);
-    qitnn_attn_apply2_batched_k<<<(total_values + 255) / 256, 256>>>(
-        g_scores,
-        d_vx,
-        d_vy,
-        d_ox,
-        d_oy,
-        batch,
-        seq_len,
-        dim
-    );
+        qitnn_attn_scores2_batched_k<<<(total_scores + 255) / 256, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            g_scores,
+            batch,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_softmax_rows_batched_k<<<(total_rows + 255) / 256, 256>>>(g_scores, batch, seq_len);
+        qitnn_attn_apply2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            g_scores,
+            d_vx,
+            d_vy,
+            d_ox,
+            d_oy,
+            batch,
+            seq_len,
+            dim
+        );
+    }
     QITNN_CU(cudaGetLastError());
 }
 
@@ -1936,15 +2379,46 @@ extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2(
     float* d_attn = nullptr;
     float* d_tmp_attn = nullptr;
     float* d_scores = nullptr;
-    qitnn_ensure_attn_backward_buffers(d_attn, d_tmp_attn, d_scores, sz_scores);
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        d_attn = qitnn_ensure_buffer(g_attn, g_attn_cap, sz_scores);
+        d_scores = qitnn_ensure_buffer(g_attn_grad, g_attn_grad_cap, sz_scores);
 
-    qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_qx, d_qy, d_kx, d_ky, d_attn, seq_len, dim, scale);
-    qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
-    qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, d_dvx, d_dvy, seq_len, dim);
-    qitnn_attn_dattn2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_dox, d_doy, d_vx, d_vy, d_tmp_attn, seq_len, dim);
-    qitnn_attn_dscores2_k<<<(seq_len + 255) / 256, 256>>>(d_attn, d_tmp_attn, d_scores, seq_len, scale);
-    qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, d_dqx, d_dqy, seq_len, dim);
-    qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, d_dkx, d_dky, seq_len, dim);
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(
+            d_qx,
+            d_qy,
+            d_kx,
+            d_ky,
+            d_attn,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
+        qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, d_dvx, d_dvy, seq_len, dim);
+        qitnn_attn_dscores2_recompute_k<<<(seq_len + 255) / 256, 256>>>(
+            d_attn,
+            d_dox,
+            d_doy,
+            d_vx,
+            d_vy,
+            d_scores,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, d_dqx, d_dqy, seq_len, dim);
+        qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, d_dkx, d_dky, seq_len, dim);
+    } else {
+        qitnn_ensure_attn_backward_buffers(d_attn, d_tmp_attn, d_scores, sz_scores);
+
+        qitnn_attn_scores2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_qx, d_qy, d_kx, d_ky, d_attn, seq_len, dim, scale);
+        qitnn_attn_softmax_rows_k<<<(seq_len + 255) / 256, 256>>>(d_attn, seq_len);
+        qitnn_attn_dv2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_attn, d_dox, d_doy, d_dvx, d_dvy, seq_len, dim);
+        qitnn_attn_dattn2_k<<<((seq_len * seq_len) + 255) / 256, 256>>>(d_dox, d_doy, d_vx, d_vy, d_tmp_attn, seq_len, dim);
+        qitnn_attn_dscores2_k<<<(seq_len + 255) / 256, 256>>>(d_attn, d_tmp_attn, d_scores, seq_len, scale);
+        qitnn_attn_dq2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_kx, d_ky, d_dqx, d_dqy, seq_len, dim);
+        qitnn_attn_dk2_k<<<((seq_len * dim) + 255) / 256, 256>>>(d_scores, d_qx, d_qy, d_dkx, d_dky, seq_len, dim);
+    }
     QITNN_CU(cudaGetLastError());
     QITNN_CU(cudaDeviceSynchronize());
 }
@@ -1981,31 +2455,66 @@ extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2Batched(
     float* d_attn = nullptr;
     float* d_tmp_attn = nullptr;
     float* d_scores = nullptr;
-    qitnn_ensure_attn_backward_buffers(d_attn, d_tmp_attn, d_scores, sz_scores);
+    if (qitnn_use_streaming_attention(seq_len, dim)) {
+        d_attn = qitnn_ensure_buffer(g_attn, g_attn_cap, sz_scores);
+        d_scores = qitnn_ensure_buffer(g_attn_grad, g_attn_grad_cap, sz_scores);
 
-    const int total_scores = batch * seq_len * seq_len;
-    const int total_rows = batch * seq_len;
-    const int total_values = batch * seq_len * dim;
+        const int total_scores = batch * seq_len * seq_len;
+        const int total_rows = batch * seq_len;
+        const int total_values = batch * seq_len * dim;
 
-    qitnn_attn_scores2_batched_k<<<(total_scores + 255) / 256, 256>>>(
-        d_qx, d_qy, d_kx, d_ky, d_attn, batch, seq_len, dim, scale
-    );
-    qitnn_attn_softmax_rows_batched_k<<<(total_rows + 255) / 256, 256>>>(d_attn, batch, seq_len);
-    qitnn_attn_dv2_batched_k<<<(total_values + 255) / 256, 256>>>(
-        d_attn, d_dox, d_doy, d_dvx, d_dvy, batch, seq_len, dim
-    );
-    qitnn_attn_dattn2_batched_k<<<(total_scores + 255) / 256, 256>>>(
-        d_dox, d_doy, d_vx, d_vy, d_tmp_attn, batch, seq_len, dim
-    );
-    qitnn_attn_dscores2_batched_k<<<(total_rows + 255) / 256, 256>>>(
-        d_attn, d_tmp_attn, d_scores, batch, seq_len, scale
-    );
-    qitnn_attn_dq2_batched_k<<<(total_values + 255) / 256, 256>>>(
-        d_scores, d_kx, d_ky, d_dqx, d_dqy, batch, seq_len, dim
-    );
-    qitnn_attn_dk2_batched_k<<<(total_values + 255) / 256, 256>>>(
-        d_scores, d_qx, d_qy, d_dkx, d_dky, batch, seq_len, dim
-    );
+        qitnn_attn_scores2_batched_k<<<(total_scores + 255) / 256, 256>>>(
+            d_qx, d_qy, d_kx, d_ky, d_attn, batch, seq_len, dim, scale
+        );
+        qitnn_attn_softmax_rows_batched_k<<<(total_rows + 255) / 256, 256>>>(d_attn, batch, seq_len);
+        qitnn_attn_dv2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_attn, d_dox, d_doy, d_dvx, d_dvy, batch, seq_len, dim
+        );
+        qitnn_attn_dscores2_recompute_batched_k<<<(total_rows + 255) / 256, 256>>>(
+            d_attn,
+            d_dox,
+            d_doy,
+            d_vx,
+            d_vy,
+            d_scores,
+            batch,
+            seq_len,
+            dim,
+            scale
+        );
+        qitnn_attn_dq2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_scores, d_kx, d_ky, d_dqx, d_dqy, batch, seq_len, dim
+        );
+        qitnn_attn_dk2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_scores, d_qx, d_qy, d_dkx, d_dky, batch, seq_len, dim
+        );
+    } else {
+        qitnn_ensure_attn_backward_buffers(d_attn, d_tmp_attn, d_scores, sz_scores);
+
+        const int total_scores = batch * seq_len * seq_len;
+        const int total_rows = batch * seq_len;
+        const int total_values = batch * seq_len * dim;
+
+        qitnn_attn_scores2_batched_k<<<(total_scores + 255) / 256, 256>>>(
+            d_qx, d_qy, d_kx, d_ky, d_attn, batch, seq_len, dim, scale
+        );
+        qitnn_attn_softmax_rows_batched_k<<<(total_rows + 255) / 256, 256>>>(d_attn, batch, seq_len);
+        qitnn_attn_dv2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_attn, d_dox, d_doy, d_dvx, d_dvy, batch, seq_len, dim
+        );
+        qitnn_attn_dattn2_batched_k<<<(total_scores + 255) / 256, 256>>>(
+            d_dox, d_doy, d_vx, d_vy, d_tmp_attn, batch, seq_len, dim
+        );
+        qitnn_attn_dscores2_batched_k<<<(total_rows + 255) / 256, 256>>>(
+            d_attn, d_tmp_attn, d_scores, batch, seq_len, scale
+        );
+        qitnn_attn_dq2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_scores, d_kx, d_ky, d_dqx, d_dqy, batch, seq_len, dim
+        );
+        qitnn_attn_dk2_batched_k<<<(total_values + 255) / 256, 256>>>(
+            d_scores, d_qx, d_qy, d_dkx, d_dky, batch, seq_len, dim
+        );
+    }
     QITNN_CU(cudaGetLastError());
     QITNN_CU(cudaDeviceSynchronize());
 }
@@ -2027,7 +2536,7 @@ extern "C" QITNN_API void Qitnn_DeviceForward3Ex(
     int out_dim
 ) {
     if (!qitnn_valid_dtype(input_dtype) || !qitnn_valid_dtype(uv_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceForward3Ex received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceForward3Ex received unsupported dtype\n");
         return;
     }
 
@@ -2061,6 +2570,61 @@ extern "C" QITNN_API void Qitnn_DeviceForward3Ex(
     qitnn_release_temp_float(tmp_in);
 }
 
+extern "C" QITNN_API void Qitnn_DeviceForward3PackedEx(
+    const void* d_input,
+    int input_dtype,
+    const float* d_a_packed,
+    void* d_out_u,
+    void* d_out_v,
+    int uv_dtype,
+    float* d_out_cn,
+    float* d_out_cz,
+    float* d_out_cp,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    if (!qitnn_init_cuda()) {
+        return;
+    }
+    if (!qitnn_valid_dtype(input_dtype) || !qitnn_valid_dtype(uv_dtype)) {
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceForward3PackedEx received unsupported dtype\n");
+        return;
+    }
+    if (d_input == nullptr || d_a_packed == nullptr) {
+        return;
+    }
+
+    const int in_count = rows * in_dim;
+    const int out_count = rows * out_dim;
+
+    float* tmp_in = nullptr;
+    float* tmp_u = nullptr;
+    float* tmp_v = nullptr;
+    float* tmp_proj = nullptr;
+    const float* d_input_f = qitnn_prepare_read_f32(d_input, input_dtype, in_count, tmp_in);
+    float* d_out_u_f = qitnn_prepare_write_f32(d_out_u, uv_dtype, out_count, tmp_u);
+    float* d_out_v_f = qitnn_prepare_write_f32(d_out_v, uv_dtype, out_count, tmp_v);
+    tmp_proj = qitnn_alloc_temp_float(out_count * 3);
+
+    qitnn_gemm_row_major(d_input_f, d_a_packed, tmp_proj, rows, out_dim * 3, in_dim);
+    qitnn_forward3_packed_epilogue_k<<<(out_count + 255) / 256, 256>>>(
+        tmp_proj,
+        d_out_u_f,
+        d_out_v_f,
+        d_out_cn,
+        d_out_cz,
+        d_out_cp,
+        out_count
+    );
+    QITNN_CU(cudaGetLastError());
+
+    qitnn_commit_write_f32(d_out_u, uv_dtype, out_count, tmp_u);
+    qitnn_commit_write_f32(d_out_v, uv_dtype, out_count, tmp_v);
+    qitnn_release_temp_float(tmp_proj);
+    qitnn_release_temp_float(tmp_in);
+}
+
 extern "C" QITNN_API void Qitnn_DeviceBackNorm3Ex(
     const void* d_du,
     const void* d_dv,
@@ -2075,7 +2639,7 @@ extern "C" QITNN_API void Qitnn_DeviceBackNorm3Ex(
     int count
 ) {
     if (!qitnn_valid_dtype(grad_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceBackNorm3Ex received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceBackNorm3Ex received unsupported dtype\n");
         return;
     }
 
@@ -2101,6 +2665,74 @@ extern "C" QITNN_API void Qitnn_DeviceBackNorm3Ex(
     qitnn_release_temp_float(tmp_dv);
 }
 
+extern "C" QITNN_API void Qitnn_DeviceBackward3PackedEx(
+    const void* d_input,
+    int input_dtype,
+    const float* d_a_packed,
+    const float* d_dcn,
+    const float* d_dcz,
+    const float* d_dcp,
+    void* d_out_input_grad,
+    float* d_out_a_packed_grad,
+    int rows,
+    int in_dim,
+    int out_dim
+) {
+    if (!qitnn_init_cuda()) {
+        return;
+    }
+    if (!qitnn_valid_dtype(input_dtype)) {
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceBackward3PackedEx received unsupported dtype\n");
+        return;
+    }
+    if (
+        d_input == nullptr ||
+        d_a_packed == nullptr ||
+        d_dcn == nullptr ||
+        d_dcz == nullptr ||
+        d_dcp == nullptr ||
+        d_out_input_grad == nullptr ||
+        d_out_a_packed_grad == nullptr
+    ) {
+        return;
+    }
+
+    const int in_count = rows * in_dim;
+    const int weight_count = in_dim * out_dim;
+
+    float* tmp_in = nullptr;
+    float* tmp_input_grad = nullptr;
+    const float* d_input_f = qitnn_prepare_read_f32(d_input, input_dtype, in_count, tmp_in);
+    float* d_out_input_grad_f = qitnn_prepare_write_f32(d_out_input_grad, input_dtype, in_count, tmp_input_grad);
+
+    qitnn_backward3_packed_input_k<<<(in_count + 255) / 256, 256>>>(
+        d_dcn,
+        d_dcz,
+        d_dcp,
+        d_a_packed,
+        d_out_input_grad_f,
+        rows,
+        in_dim,
+        out_dim
+    );
+    QITNN_CU(cudaGetLastError());
+
+    qitnn_backward3_packed_weight_k<<<(weight_count + 255) / 256, 256>>>(
+        d_input_f,
+        d_dcn,
+        d_dcz,
+        d_dcp,
+        d_out_a_packed_grad,
+        rows,
+        in_dim,
+        out_dim
+    );
+    QITNN_CU(cudaGetLastError());
+
+    qitnn_commit_write_f32(d_out_input_grad, input_dtype, in_count, tmp_input_grad);
+    qitnn_release_temp_float(tmp_in);
+}
+
 extern "C" QITNN_API void Qitnn_DevicePriorEx(
     void* d_an,
     void* d_az,
@@ -2111,7 +2743,7 @@ extern "C" QITNN_API void Qitnn_DevicePriorEx(
     int count
 ) {
     if (!qitnn_valid_dtype(dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DevicePriorEx received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DevicePriorEx received unsupported dtype\n");
         return;
     }
 
@@ -2159,7 +2791,7 @@ extern "C" QITNN_API void Qitnn_DeviceCenteredSimplexEx(
     int count
 ) {
     if (!qitnn_valid_dtype(in_dtype) || !qitnn_valid_dtype(out_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceCenteredSimplexEx received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceCenteredSimplexEx received unsupported dtype\n");
         return;
     }
 
@@ -2202,7 +2834,7 @@ extern "C" QITNN_API void Qitnn_DeviceAttention2Ex(
     int dim
 ) {
     if (!qitnn_valid_dtype(dtype) || !qitnn_valid_dtype(out_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttention2Ex received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceAttention2Ex received unsupported dtype\n");
         return;
     }
 
@@ -2265,7 +2897,7 @@ extern "C" QITNN_API void Qitnn_DeviceAttention2BatchedEx(
     int dim
 ) {
     if (!qitnn_valid_dtype(dtype) || !qitnn_valid_dtype(out_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttention2BatchedEx received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceAttention2BatchedEx received unsupported dtype\n");
         return;
     }
 
@@ -2334,7 +2966,7 @@ extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2Ex(
     int dim
 ) {
     if (!qitnn_valid_dtype(in_dtype) || !qitnn_valid_dtype(out_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttentionBackward2Ex received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceAttentionBackward2Ex received unsupported dtype\n");
         return;
     }
 
@@ -2427,7 +3059,7 @@ extern "C" QITNN_API void Qitnn_DeviceAttentionBackward2BatchedEx(
     int dim
 ) {
     if (!qitnn_valid_dtype(in_dtype) || !qitnn_valid_dtype(out_dtype)) {
-        std::fprintf(stderr, "[libQITNN] Qitnn_DeviceAttentionBackward2BatchedEx received unsupported dtype\n");
+        std::fprintf(stderr, "[PyQITNN] Qitnn_DeviceAttentionBackward2BatchedEx received unsupported dtype\n");
         return;
     }
 

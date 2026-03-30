@@ -64,7 +64,7 @@ class TrainConfig:
     # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
     #====================
-    dataset: str | Path = r"Your_path_to_dataset"   # path to a file or directory with training data
+    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
@@ -74,14 +74,14 @@ class TrainConfig:
     json_text_fields: str | None = None   # comma-separated preferred text fields, e.g. "text,content"
     tokenizer: str = "bpe"           # "byte" or "bpe"
     tokenizer_path: str | Path | None = None
-    tokenizer_vocab_size: int = 4096
+    tokenizer_vocab_size: int = 2048
     tokenizer_min_frequency: int = 2
 
     #====================
     # model
     #====================
-    dim: int = 256
-    ffn: int = 512
+    dim: int = 128
+    ffn: int = 256
     layers: int = 2
     seq_len: int = 256
 
@@ -90,11 +90,11 @@ class TrainConfig:
     #====================
     device: str = "cuda:0"
     seed: int = 7
-    batch_size: int = 4
+    batch_size: int = 8
     grad_accum_steps: int = 1      # micro-batches per optimizer step; 1 keeps the legacy trainer contract
     steps: int | None = None         # if set, overrides epochs/steps_per_epoch
-    epochs: int = 20
-    steps_per_epoch: int = 2000
+    epochs: int = 10
+    steps_per_epoch: int = 1000
     grad_clip: float = 1.0
     mixed_precision: bool | None = None   # legacy compatibility knob for older trainer calls
     precision_mode: str | None = None     # canonical precision selector; None resolves to trainer default
@@ -165,12 +165,12 @@ class TrainConfig:
     prompt: str = ""                 # empty = use random slice from training data
     prompt_bytes: int = 64
     prompt_tokens: int | None = None
-    gen_every: int = 0               # generate sample every N epochs
+    gen_every: int = 1               # generate sample every N epochs
     #====================
     # logging
     #====================
-    log_every: int = 500             # print loss every N steps
-    diag_every: int = 5             # full QTS diagnostics every N epochs
+    log_every: int = 100             # print loss every N steps
+    diag_every: int = 2             # full QTS diagnostics every N epochs
     csv_log: str | None = None       # None = auto-create in run directory
     #====================
     # saving
@@ -1332,6 +1332,7 @@ def train(cfg: TrainConfig | None = None, **kwargs) -> dict:
     print(f"precision_mode {precision_mode}")
     print(f"lr            {lr_start} -> {lr_end}  ({cfg.lr_schedule})")
     print(f"seed          {cfg.seed}")
+    print(f"seq_len       {cfg.seq_len}")
     if run_dir is not None:
         print(f"run_dir       {run_dir}")
         print(f"csv_log       {csv_path}")

@@ -55,7 +55,7 @@ from BasicQITNN_Transformer import (
 from pyqitnn.diagnostics import QITNN_DIAG_CSV_HEADER
 from pyqitnn.diagnostics import QITNN_DIAG_STAT_KEYS
 from pyqitnn.diagnostics import format_qitnn_diag_snapshot
-from pyqitnn.ops import forward3, prior_, centered_simplex, attention2
+from pyqitnn.ops import forward3, forward3_packed_reference, prior_, centered_simplex, attention2
 from pyqitnn.bridge import load_native
 from pyqitnn.precision import resolve_precision_mode as resolve_precision_mode_shared
 
@@ -94,6 +94,46 @@ def capture_runtime_error(fn):
 def cleanup_tree(path: Path):
     if path.is_dir():
         shutil.rmtree(path, ignore_errors=True)
+
+
+@torch.no_grad()
+def _generate_reference_loop(
+    model,
+    tokens: torch.Tensor,
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_k: int,
+    ascii_guard: bool,
+) -> torch.Tensor:
+    out = tokens.clone()
+    for _ in range(max_new_tokens):
+        idx = out[:, -model.seq_len:]
+        logits, _ = model(idx)
+        nxt = logits[:, -1, :]
+
+        if ascii_guard:
+            mask = torch.zeros_like(nxt, dtype=torch.bool)
+            mask[:, 0] = True
+            mask[:, 9] = True
+            mask[:, 10] = True
+            mask[:, 13] = True
+            mask[:, 32:127] = True
+            nxt = nxt.masked_fill(~mask, float("-inf"))
+
+        if temperature <= 0.0:
+            tok = torch.argmax(nxt, dim=-1, keepdim=True)
+        else:
+            nxt = nxt / temperature
+            if 0 < top_k < nxt.size(-1):
+                top_vals, _ = torch.topk(nxt, top_k, dim=-1)
+                cutoff = top_vals[:, -1].unsqueeze(-1)
+                nxt = nxt.masked_fill(nxt < cutoff, float("-inf"))
+            probs = torch.softmax(nxt, dim=-1)
+            tok = torch.multinomial(probs, num_samples=1)
+
+        out = torch.cat([out, tok], dim=1)
+    return out
 
 import pyqitnn
 
@@ -139,6 +179,491 @@ def test_born_rule_sum():
         min_p = min(p_neg.min().item(), p_zero.min().item(), p_pos.min().item())
         check(f"Born P>=0  [{rows}x{in_d}->{out_d}] min_P={min_p:.2e}",
               min_p >= -1e-6, f"min_P={min_p}")
+
+
+#====================
+# forward3 raw-channel contract: cn/cz/cp must stay as linear amplitude projections
+#====================
+
+def _manual_forward3_from_raw_channels(
+    cn: torch.Tensor,
+    cz: torch.Tensor,
+    cp: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cn_f = cn.float()
+    cz_f = cz.float()
+    cp_f = cp.float()
+    cn2 = cn_f.square()
+    cz2 = cz_f.square()
+    cp2 = cp_f.square()
+    z = cn2 + cz2 + cp2
+    inv_z = torch.where(z > 1e-12, z.reciprocal(), torch.zeros_like(z))
+    u = (cp2 - cn2) * inv_z
+    v = cz2 * inv_z
+    return u, v
+
+
+#====================
+# forward3 raw-channel contract: cn/cz/cp must stay as linear amplitude projections
+#====================
+
+def test_forward3_raw_channel_projection_contract():
+    """forward3 raw channels must equal the three linear amplitude projections"""
+    print("\n=== test_forward3_raw_channel_projection_contract ===")
+    torch.manual_seed(43)
+
+    for rows, in_d, out_d in [(4, 16, 8), (3, 31, 11), (9, 64, 32)]:
+        inp = torch.randn(rows, in_d, device=DEVICE)
+        a_n = torch.randn(in_d, out_d, device=DEVICE)
+        a_z = torch.randn(in_d, out_d, device=DEVICE)
+        a_p = torch.randn(in_d, out_d, device=DEVICE)
+
+        _, _, cn, cz, cp = forward3(inp, a_n, a_z, a_p)
+        ref_cn = inp @ a_n
+        ref_cz = inp @ a_z
+        ref_cp = inp @ a_p
+
+        err_cn = (cn - ref_cn).abs().max().item()
+        err_cz = (cz - ref_cz).abs().max().item()
+        err_cp = (cp - ref_cp).abs().max().item()
+
+        check(f"raw cn matches inp@a_neg [{rows}x{in_d}->{out_d}]", err_cn < 1e-5, f"max_err={err_cn:.2e}")
+        check(f"raw cz matches inp@a_zero [{rows}x{in_d}->{out_d}]", err_cz < 1e-5, f"max_err={err_cz:.2e}")
+        check(f"raw cp matches inp@a_pos [{rows}x{in_d}->{out_d}]", err_cp < 1e-5, f"max_err={err_cp:.2e}")
+        check(
+            f"raw channels stay fp32 [{rows}x{in_d}->{out_d}]",
+            cn.dtype == torch.float32 and cz.dtype == torch.float32 and cp.dtype == torch.float32,
+            f"dtypes={cn.dtype}/{cz.dtype}/{cp.dtype}",
+        )
+
+
+#====================
+# forward3 raw-channel contract: Born/simplex outputs must remain reconstructible from cn/cz/cp
+#====================
+
+def test_forward3_raw_channel_simplex_contract():
+    """u/v and centered simplex outputs must be reconstructible from raw channels"""
+    print("\n=== test_forward3_raw_channel_simplex_contract ===")
+    torch.manual_seed(44)
+    sqrt3 = 1.7320508075688772
+    inv_sqrt3 = 0.5773502691896258
+
+    for rows, in_d, out_d in [(4, 16, 8), (5, 19, 7), (2, 128, 33)]:
+        inp = torch.randn(rows, in_d, device=DEVICE)
+        a_n = torch.randn(in_d, out_d, device=DEVICE)
+        a_z = torch.randn(in_d, out_d, device=DEVICE)
+        a_p = torch.randn(in_d, out_d, device=DEVICE)
+
+        u, v, cn, cz, cp = forward3(inp, a_n, a_z, a_p)
+        x, y = centered_simplex(u, v)
+
+        ref_u, ref_v = _manual_forward3_from_raw_channels(cn, cz, cp)
+        ref_x = ref_u
+        ref_y = (sqrt3 * ref_v) - inv_sqrt3
+
+        err_u = (u.float() - ref_u).abs().max().item()
+        err_v = (v.float() - ref_v).abs().max().item()
+        err_x = (x.float() - ref_x).abs().max().item()
+        err_y = (y.float() - ref_y).abs().max().item()
+
+        check(f"u matches raw Born normalization [{rows}x{in_d}->{out_d}]", err_u < 1e-6, f"max_err={err_u:.2e}")
+        check(f"v matches raw Born normalization [{rows}x{in_d}->{out_d}]", err_v < 1e-6, f"max_err={err_v:.2e}")
+        check(f"x matches raw-channel simplex map [{rows}x{in_d}->{out_d}]", err_x < 1e-6, f"max_err={err_x:.2e}")
+        check(f"y matches raw-channel simplex map [{rows}x{in_d}->{out_d}]", err_y < 1e-6, f"max_err={err_y:.2e}")
+
+
+#====================
+# forward3 mixed raw-channel contract: mixed visible path must stay finite while raw channels remain fp32
+#====================
+
+def test_forward3_mixed_raw_channel_contract():
+    """mixed forward3 must keep raw channels fp32 and finite across scale regimes"""
+    print("\n=== test_forward3_mixed_raw_channel_contract ===")
+    torch.manual_seed(45)
+
+    modes: list[tuple[str, torch.dtype, float]] = [
+        ("fp16", torch.float16, 5e-3),
+    ]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("bf16", torch.bfloat16, 5e-2))
+
+    for mode_name, input_dtype, uv_tol in modes:
+        for scale in (1e-4, 1.0, 1e2, 1e4):
+            inp = torch.randn(8, 16, device=DEVICE, dtype=input_dtype, requires_grad=True)
+            a_n = (torch.randn(16, 8, device=DEVICE, dtype=torch.float32) * scale).requires_grad_()
+            a_z = (torch.randn(16, 8, device=DEVICE, dtype=torch.float32) * scale).requires_grad_()
+            a_p = (torch.randn(16, 8, device=DEVICE, dtype=torch.float32) * scale).requires_grad_()
+
+            u, v, cn, cz, cp = forward3(inp, a_n, a_z, a_p, mixed_precision=True)
+            ref_cn = inp.float() @ a_n
+            ref_cz = inp.float() @ a_z
+            ref_cp = inp.float() @ a_p
+            ref_u, ref_v = _manual_forward3_from_raw_channels(ref_cn, ref_cz, ref_cp)
+
+            loss = u.float().square().mean() + v.float().square().mean()
+            loss.backward()
+
+            err_cn = (cn - ref_cn).abs().max().item()
+            err_cz = (cz - ref_cz).abs().max().item()
+            err_cp = (cp - ref_cp).abs().max().item()
+            err_u = (u.float() - ref_u).abs().max().item()
+            err_v = (v.float() - ref_v).abs().max().item()
+            finite_ok = all(
+                torch.isfinite(t).all().item()
+                for t in (u.float(), v.float(), cn, cz, cp, inp.grad.float(), a_n.grad, a_z.grad, a_p.grad)
+            )
+
+            check(f"mixed raw cn stays fp32 [{mode_name} scale={scale:g}]", cn.dtype == torch.float32, f"dtype={cn.dtype}")
+            check(f"mixed raw cz stays fp32 [{mode_name} scale={scale:g}]", cz.dtype == torch.float32, f"dtype={cz.dtype}")
+            check(f"mixed raw cp stays fp32 [{mode_name} scale={scale:g}]", cp.dtype == torch.float32, f"dtype={cp.dtype}")
+            check(f"mixed u stays activation dtype [{mode_name} scale={scale:g}]", u.dtype == input_dtype, f"dtype={u.dtype}")
+            check(f"mixed v stays activation dtype [{mode_name} scale={scale:g}]", v.dtype == input_dtype, f"dtype={v.dtype}")
+            check(f"mixed raw cn parity [{mode_name} scale={scale:g}]", err_cn < 1e-4, f"max_err={err_cn:.2e}")
+            check(f"mixed raw cz parity [{mode_name} scale={scale:g}]", err_cz < 1e-4, f"max_err={err_cz:.2e}")
+            check(f"mixed raw cp parity [{mode_name} scale={scale:g}]", err_cp < 1e-4, f"max_err={err_cp:.2e}")
+            check(f"mixed u parity [{mode_name} scale={scale:g}]", err_u < uv_tol, f"max_err={err_u:.2e}")
+            check(f"mixed v parity [{mode_name} scale={scale:g}]", err_v < uv_tol, f"max_err={err_v:.2e}")
+            check(f"mixed path stays finite [{mode_name} scale={scale:g}]", finite_ok)
+
+
+#====================
+# forward3 split backward contract: native split backward must match reference backnorm + matmul assembly
+#====================
+
+def test_forward3_split_backward_native_contract():
+    """split forward3 backward must match the reference backnorm + Python matmul assembly"""
+    print("\n=== test_forward3_split_backward_native_contract ===")
+    torch.manual_seed(52)
+    ext = load_native()
+
+    modes: list[tuple[str, torch.dtype, bool, float, float]] = [("fp32", torch.float32, False, 1e-5, 1e-5)]
+    modes.append(("fp16", torch.float16, True, 3e-3, 5e-4))
+    if torch.cuda.is_bf16_supported():
+        modes.append(("bf16", torch.bfloat16, True, 1e-2, 5e-4))
+
+    for mode_name, input_dtype, mixed_precision, inp_tol, weight_tol in modes:
+        rows, in_d, out_d = 4, 23, 17
+        ent_lambda = 0.17
+
+        inp = torch.randn(rows, in_d, device=DEVICE, dtype=input_dtype, requires_grad=True)
+        a_neg = torch.randn(in_d, out_d, device=DEVICE, requires_grad=True)
+        a_zero = torch.randn(in_d, out_d, device=DEVICE, requires_grad=True)
+        a_pos = torch.randn(in_d, out_d, device=DEVICE, requires_grad=True)
+
+        u, v, cn, cz, cp = forward3(
+            inp,
+            a_neg,
+            a_zero,
+            a_pos,
+            ent_lambda=ent_lambda,
+            mixed_precision=mixed_precision,
+        )
+        loss = (
+            0.7 * u.float().square().mean()
+            + 0.5 * v.float().square().mean()
+            + 0.1 * cn.square().mean()
+            + 0.2 * cz.square().mean()
+            + 0.3 * cp.square().mean()
+        )
+
+        grad_u, grad_v, grad_cn, grad_cz, grad_cp = torch.autograd.grad(
+            loss,
+            (u, v, cn, cz, cp),
+            retain_graph=True,
+        )
+        loss.backward()
+
+        ref_dcn, ref_dcz, ref_dcp = ext.backnorm3_cuda(
+            grad_u.contiguous(),
+            grad_v.contiguous(),
+            cn.detach(),
+            cz.detach(),
+            cp.detach(),
+            ent_lambda,
+        )
+        ref_dcn = ref_dcn + grad_cn.contiguous().to(dtype=torch.float32)
+        ref_dcz = ref_dcz + grad_cz.contiguous().to(dtype=torch.float32)
+        ref_dcp = ref_dcp + grad_cp.contiguous().to(dtype=torch.float32)
+
+        inp_fp32 = inp.detach() if inp.dtype == torch.float32 else inp.detach().to(dtype=torch.float32)
+        ref_g_inp = ref_dcn @ a_neg.detach().t() + ref_dcz @ a_zero.detach().t() + ref_dcp @ a_pos.detach().t()
+        if input_dtype != torch.float32:
+            ref_g_inp = ref_g_inp.to(dtype=input_dtype)
+        ref_g_neg = inp_fp32.t() @ ref_dcn
+        ref_g_zero = inp_fp32.t() @ ref_dcz
+        ref_g_pos = inp_fp32.t() @ ref_dcp
+
+        inp_err = (inp.grad.float() - ref_g_inp.float()).abs().max().item()
+        neg_err = (a_neg.grad - ref_g_neg).abs().max().item()
+        zero_err = (a_zero.grad - ref_g_zero).abs().max().item()
+        pos_err = (a_pos.grad - ref_g_pos).abs().max().item()
+        finite_ok = all(
+            torch.isfinite(t.float()).all().item()
+            for t in (inp.grad, a_neg.grad, a_zero.grad, a_pos.grad)
+        )
+
+        check(f"split backward input grad dtype [{mode_name}]", inp.grad.dtype == input_dtype, f"dtype={inp.grad.dtype}")
+        check(f"split backward input grad parity [{mode_name}]", inp_err < inp_tol, f"max_err={inp_err:.2e}")
+        check(f"split backward a_neg grad parity [{mode_name}]", neg_err < weight_tol, f"max_err={neg_err:.2e}")
+        check(f"split backward a_zero grad parity [{mode_name}]", zero_err < weight_tol, f"max_err={zero_err:.2e}")
+        check(f"split backward a_pos grad parity [{mode_name}]", pos_err < weight_tol, f"max_err={pos_err:.2e}")
+        check(f"split backward stays finite [{mode_name}]", finite_ok)
+
+
+#====================
+# forward3 packed reference contract: packed native path must match split native path
+#====================
+
+def test_forward3_packed_reference_parity():
+    """packed forward3 reference path must match split forward3 path in fp32"""
+    print("\n=== test_forward3_packed_reference_parity ===")
+    torch.manual_seed(46)
+
+    for rows, in_d, out_d in [(4, 16, 8), (3, 31, 11), (2, 128, 33)]:
+        inp = torch.randn(rows, in_d, device=DEVICE)
+        a_n = torch.randn(in_d, out_d, device=DEVICE)
+        a_z = torch.randn(in_d, out_d, device=DEVICE)
+        a_p = torch.randn(in_d, out_d, device=DEVICE)
+        a_packed = torch.stack((a_n, a_z, a_p), dim=-1).contiguous()
+
+        split_out = forward3(inp, a_n, a_z, a_p)
+        packed_out = forward3_packed_reference(inp, a_packed)
+
+        for name, left, right in zip(("u", "v", "cn", "cz", "cp"), split_out, packed_out):
+            max_err = (left.float() - right.float()).abs().max().item()
+            check(f"packed ref matches split {name} [{rows}x{in_d}->{out_d}]", max_err < 1e-6, f"max_err={max_err:.2e}")
+
+
+#====================
+# forward3 packed reference contract: mixed path must preserve parity and dtype contract
+#====================
+
+def test_forward3_packed_reference_mixed_parity():
+    """packed forward3 reference path must match split forward3 path under mixed precision"""
+    print("\n=== test_forward3_packed_reference_mixed_parity ===")
+    torch.manual_seed(47)
+
+    modes: list[tuple[str, torch.dtype]] = [("fp16", torch.float16)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("bf16", torch.bfloat16))
+
+    for mode_name, input_dtype in modes:
+        for scale in (1e-4, 1.0, 1e2, 1e4):
+            inp = torch.randn(8, 16, device=DEVICE, dtype=input_dtype)
+            a_n = torch.randn(16, 8, device=DEVICE) * scale
+            a_z = torch.randn(16, 8, device=DEVICE) * scale
+            a_p = torch.randn(16, 8, device=DEVICE) * scale
+            a_packed = torch.stack((a_n, a_z, a_p), dim=-1).contiguous()
+
+            split_out = forward3(inp, a_n, a_z, a_p, mixed_precision=True)
+            packed_out = forward3_packed_reference(inp, a_packed, mixed_precision=True)
+
+            for name, left, right in zip(("u", "v", "cn", "cz", "cp"), split_out, packed_out):
+                max_err = (left.float() - right.float()).abs().max().item()
+                check(f"packed ref mixed parity {name} [{mode_name} scale={scale:g}]", max_err < 1e-6, f"max_err={max_err:.2e}")
+
+            u_ref, v_ref, cn_ref, cz_ref, cp_ref = packed_out
+            finite_ok = all(torch.isfinite(t.float()).all().item() for t in (u_ref, v_ref, cn_ref, cz_ref, cp_ref))
+            check(f"packed ref mixed u dtype [{mode_name} scale={scale:g}]", u_ref.dtype == input_dtype, f"dtype={u_ref.dtype}")
+            check(f"packed ref mixed v dtype [{mode_name} scale={scale:g}]", v_ref.dtype == input_dtype, f"dtype={v_ref.dtype}")
+            check(f"packed ref mixed raw dtype [{mode_name} scale={scale:g}]", cn_ref.dtype == torch.float32 and cz_ref.dtype == torch.float32 and cp_ref.dtype == torch.float32, f"dtypes={cn_ref.dtype}/{cz_ref.dtype}/{cp_ref.dtype}")
+            check(f"packed ref mixed path stays finite [{mode_name} scale={scale:g}]", finite_ok)
+
+
+#====================
+# forward3 packed projection contract: direct packed kernel must match manual raw matmuls
+#====================
+
+def test_forward3_packed_reference_raw_projection_contract():
+    """packed forward3 path must preserve raw projection indexing and Born reconstruction"""
+    print("\n=== test_forward3_packed_reference_raw_projection_contract ===")
+    torch.manual_seed(49)
+
+    for rows, in_d, out_d in [(7, 53, 29), (5, 65, 17), (3, 96, 41)]:
+        inp = torch.randn(rows, in_d, device=DEVICE)
+        a_n = torch.randn(in_d, out_d, device=DEVICE)
+        a_z = torch.randn(in_d, out_d, device=DEVICE)
+        a_p = torch.randn(in_d, out_d, device=DEVICE)
+        a_packed = torch.stack((a_n, a_z, a_p), dim=-1).contiguous()
+
+        u, v, cn, cz, cp = forward3_packed_reference(inp, a_packed)
+        ref_cn = inp @ a_n
+        ref_cz = inp @ a_z
+        ref_cp = inp @ a_p
+        ref_u, ref_v = _manual_forward3_from_raw_channels(ref_cn, ref_cz, ref_cp)
+
+        err_cn = (cn - ref_cn).abs().max().item()
+        err_cz = (cz - ref_cz).abs().max().item()
+        err_cp = (cp - ref_cp).abs().max().item()
+        err_u = (u.float() - ref_u).abs().max().item()
+        err_v = (v.float() - ref_v).abs().max().item()
+
+        check(f"packed kernel raw cn contract [{rows}x{in_d}->{out_d}]", err_cn < 1e-6, f"max_err={err_cn:.2e}")
+        check(f"packed kernel raw cz contract [{rows}x{in_d}->{out_d}]", err_cz < 1e-6, f"max_err={err_cz:.2e}")
+        check(f"packed kernel raw cp contract [{rows}x{in_d}->{out_d}]", err_cp < 1e-6, f"max_err={err_cp:.2e}")
+        check(f"packed kernel Born u contract [{rows}x{in_d}->{out_d}]", err_u < 1e-6, f"max_err={err_u:.2e}")
+        check(f"packed kernel Born v contract [{rows}x{in_d}->{out_d}]", err_v < 1e-6, f"max_err={err_v:.2e}")
+
+
+#====================
+# forward3 packed epilogue contract: fused uv path must agree with returned raw channels
+#====================
+
+def test_forward3_packed_reference_fused_epilogue_contract():
+    """packed forward3 fused epilogue must derive uv from the same raw channels it returns"""
+    print("\n=== test_forward3_packed_reference_fused_epilogue_contract ===")
+    torch.manual_seed(50)
+
+    modes: list[tuple[str, torch.dtype, bool]] = [("fp32", torch.float32, False), ("fp16", torch.float16, True)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("bf16", torch.bfloat16, True))
+
+    for mode_name, input_dtype, mixed_precision in modes:
+        inp = torch.randn(6, 37, device=DEVICE, dtype=input_dtype)
+        a_n = torch.randn(37, 19, device=DEVICE)
+        a_z = torch.randn(37, 19, device=DEVICE)
+        a_p = torch.randn(37, 19, device=DEVICE)
+        a_packed = torch.stack((a_n, a_z, a_p), dim=-1).contiguous()
+
+        u, v, cn, cz, cp = forward3_packed_reference(inp, a_packed, mixed_precision=mixed_precision)
+        ref_u, ref_v = _manual_forward3_from_raw_channels(cn, cz, cp)
+        ref_visible_u = ref_u.to(dtype=u.dtype).float()
+        ref_visible_v = ref_v.to(dtype=v.dtype).float()
+        err_u = (u.float() - ref_visible_u).abs().max().item()
+        err_v = (v.float() - ref_visible_v).abs().max().item()
+
+        check(f"fused epilogue u contract [{mode_name}]", err_u < 1e-6, f"max_err={err_u:.2e}")
+        check(f"fused epilogue v contract [{mode_name}]", err_v < 1e-6, f"max_err={err_v:.2e}")
+
+        zero_inp = torch.zeros(4, 37, device=DEVICE, dtype=input_dtype)
+        zero_u, zero_v, zero_cn, zero_cz, zero_cp = forward3_packed_reference(
+            zero_inp,
+            a_packed,
+            mixed_precision=mixed_precision,
+        )
+        finite_ok = all(torch.isfinite(t.float()).all().item() for t in (zero_u, zero_v, zero_cn, zero_cz, zero_cp))
+        zero_u_max = zero_u.float().abs().max().item()
+        zero_v_max = zero_v.float().abs().max().item()
+        zero_cn_max = zero_cn.abs().max().item()
+        zero_cz_max = zero_cz.abs().max().item()
+        zero_cp_max = zero_cp.abs().max().item()
+
+        check(f"fused epilogue zero guard finite [{mode_name}]", finite_ok)
+        check(f"fused epilogue zero raw cn [{mode_name}]", zero_cn_max < 1e-8, f"max_abs={zero_cn_max:.2e}")
+        check(f"fused epilogue zero raw cz [{mode_name}]", zero_cz_max < 1e-8, f"max_abs={zero_cz_max:.2e}")
+        check(f"fused epilogue zero raw cp [{mode_name}]", zero_cp_max < 1e-8, f"max_abs={zero_cp_max:.2e}")
+        check(f"fused epilogue zero u [{mode_name}]", zero_u_max < 1e-8, f"max_abs={zero_u_max:.2e}")
+        check(f"fused epilogue zero v [{mode_name}]", zero_v_max < 1e-8, f"max_abs={zero_v_max:.2e}")
+
+
+#====================
+# forward3 packed reference contract: invalid ternary packed layout must fail loudly
+#====================
+
+def test_forward3_packed_reference_rejects_bad_layout():
+    """packed forward3 reference path should reject malformed ternary layouts"""
+    print("\n=== test_forward3_packed_reference_rejects_bad_layout ===")
+    torch.manual_seed(48)
+
+    inp = torch.randn(4, 16, device=DEVICE)
+    bad_rank = torch.randn(16, 8, device=DEVICE)
+    bad_last_dim = torch.randn(16, 8, 2, device=DEVICE)
+
+    bad_rank_msg = capture_runtime_error(lambda: forward3_packed_reference(inp, bad_rank))
+    bad_last_dim_msg = capture_runtime_error(lambda: forward3_packed_reference(inp, bad_last_dim))
+
+    check("packed ref rejects non-3D weight tensor", "3D" in bad_rank_msg, bad_rank_msg or "no RuntimeError")
+    check("packed ref rejects non-ternary last dim", "last dim must be 3" in bad_last_dim_msg, bad_last_dim_msg or "no RuntimeError")
+
+
+#====================
+# forward3 packed reference contract: backward path must match split gradients
+#====================
+
+def test_forward3_packed_reference_backward_parity():
+    """packed forward3 backward must match split backward for input and ternary weights"""
+    print("\n=== test_forward3_packed_reference_backward_parity ===")
+    torch.manual_seed(51)
+
+    modes: list[tuple[str, torch.dtype, bool, float, float]] = [("fp32", torch.float32, False, 1e-5, 1e-5)]
+    modes.append(("fp16", torch.float16, True, 3e-3, 5e-4))
+    if torch.cuda.is_bf16_supported():
+        modes.append(("bf16", torch.bfloat16, True, 1e-2, 5e-4))
+
+    for mode_name, input_dtype, mixed_precision, inp_tol, weight_tol in modes:
+        rows, in_d, out_d = 4, 23, 17
+        ent_lambda = 0.17
+        base_inp = torch.randn(rows, in_d, device=DEVICE, dtype=input_dtype)
+        base_neg = torch.randn(in_d, out_d, device=DEVICE)
+        base_zero = torch.randn(in_d, out_d, device=DEVICE)
+        base_pos = torch.randn(in_d, out_d, device=DEVICE)
+
+        split_inp = base_inp.detach().clone().requires_grad_(True)
+        split_neg = base_neg.detach().clone().requires_grad_(True)
+        split_zero = base_zero.detach().clone().requires_grad_(True)
+        split_pos = base_pos.detach().clone().requires_grad_(True)
+        split_u, split_v, split_cn, split_cz, split_cp = forward3(
+            split_inp,
+            split_neg,
+            split_zero,
+            split_pos,
+            ent_lambda=ent_lambda,
+            mixed_precision=mixed_precision,
+        )
+        split_loss = (
+            0.7 * split_u.float().square().mean()
+            + 0.5 * split_v.float().square().mean()
+            + 0.1 * split_cn.square().mean()
+            + 0.2 * split_cz.square().mean()
+            + 0.3 * split_cp.square().mean()
+        )
+        split_loss.backward()
+
+        packed_inp = base_inp.detach().clone().requires_grad_(True)
+        packed_weight = torch.stack((base_neg, base_zero, base_pos), dim=-1).contiguous().detach().requires_grad_(True)
+        packed_u, packed_v, packed_cn, packed_cz, packed_cp = forward3_packed_reference(
+            packed_inp,
+            packed_weight,
+            ent_lambda=ent_lambda,
+            mixed_precision=mixed_precision,
+        )
+        packed_loss = (
+            0.7 * packed_u.float().square().mean()
+            + 0.5 * packed_v.float().square().mean()
+            + 0.1 * packed_cn.square().mean()
+            + 0.2 * packed_cz.square().mean()
+            + 0.3 * packed_cp.square().mean()
+        )
+        packed_loss.backward()
+
+        check(f"packed backward input grad exists [{mode_name}]", packed_inp.grad is not None, "grad is None")
+        check(f"packed backward packed grad exists [{mode_name}]", packed_weight.grad is not None, "grad is None")
+        if packed_inp.grad is None or packed_weight.grad is None:
+            continue
+
+        inp_err = (split_inp.grad.float() - packed_inp.grad.float()).abs().max().item()
+        neg_err = (split_neg.grad - packed_weight.grad[..., 0]).abs().max().item()
+        zero_err = (split_zero.grad - packed_weight.grad[..., 1]).abs().max().item()
+        pos_err = (split_pos.grad - packed_weight.grad[..., 2]).abs().max().item()
+        loss_err = abs(float(split_loss.detach().float()) - float(packed_loss.detach().float()))
+        finite_ok = all(
+            torch.isfinite(t.float()).all().item()
+            for t in (
+                packed_inp.grad,
+                packed_weight.grad[..., 0],
+                packed_weight.grad[..., 1],
+                packed_weight.grad[..., 2],
+            )
+        )
+
+        check(f"packed backward loss parity [{mode_name}]", loss_err < 1e-6, f"loss_err={loss_err:.2e}")
+        check(f"packed backward input grad dtype [{mode_name}]", packed_inp.grad.dtype == input_dtype, f"dtype={packed_inp.grad.dtype}")
+        check(f"packed backward weight grad dtype [{mode_name}]", packed_weight.grad.dtype == torch.float32, f"dtype={packed_weight.grad.dtype}")
+        check(f"packed backward input grad parity [{mode_name}]", inp_err < inp_tol, f"max_err={inp_err:.2e}")
+        check(f"packed backward a_neg grad parity [{mode_name}]", neg_err < weight_tol, f"max_err={neg_err:.2e}")
+        check(f"packed backward a_zero grad parity [{mode_name}]", zero_err < weight_tol, f"max_err={zero_err:.2e}")
+        check(f"packed backward a_pos grad parity [{mode_name}]", pos_err < weight_tol, f"max_err={pos_err:.2e}")
+        check(f"packed backward stays finite [{mode_name}]", finite_ok)
 
 
 #====================
@@ -363,6 +888,75 @@ def test_attention2_vs_sdpa():
 
 
 #====================
+# attention2 forward contract: long-sequence streaming path must match SDPA
+#====================
+
+def test_attention2_streaming_forward_large_seq_contract():
+    """long-sequence attention2 forward should match SDPA without changing causal simplex semantics"""
+    print("\n=== test_attention2_streaming_forward_large_seq_contract ===")
+    torch.manual_seed(58)
+
+    seq_len, dim = 513, 64
+    q = torch.randn(seq_len, dim, device=DEVICE)
+    k = torch.randn(seq_len, dim, device=DEVICE)
+    v = torch.randn(seq_len, dim, device=DEVICE)
+
+    out = attention2(q, k, v)
+    out_ref = F.scaled_dot_product_attention(
+        q.unsqueeze(0).unsqueeze(0),
+        k.unsqueeze(0).unsqueeze(0),
+        v.unsqueeze(0).unsqueeze(0),
+        dropout_p=0.0,
+        is_causal=True,
+    ).squeeze(0).squeeze(0)
+
+    max_err = (out - out_ref).abs().max().item()
+    check(f"attn2 streaming fwd [513x64] max_err={max_err:.6f}", max_err < 0.02, f"err={max_err}")
+
+
+#====================
+# attention2 backward contract: long-sequence streaming backward must match SDPA
+#====================
+
+def test_attention2_streaming_backward_large_seq_contract():
+    """long-sequence attention2 backward should match SDPA under streaming recomputation"""
+    print("\n=== test_attention2_streaming_backward_large_seq_contract ===")
+    torch.manual_seed(60)
+
+    seq_len, dim = 513, 64
+    q = torch.randn(seq_len, dim, device=DEVICE, requires_grad=True)
+    k = torch.randn(seq_len, dim, device=DEVICE, requires_grad=True)
+    v = torch.randn(seq_len, dim, device=DEVICE, requires_grad=True)
+
+    q_ref = q.detach().clone().requires_grad_(True)
+    k_ref = k.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+
+    out = attention2(q, k, v)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+
+    out_ref = F.scaled_dot_product_attention(
+        q_ref.unsqueeze(0).unsqueeze(0),
+        k_ref.unsqueeze(0).unsqueeze(0),
+        v_ref.unsqueeze(0).unsqueeze(0),
+        dropout_p=0.0,
+        is_causal=True,
+    ).squeeze(0).squeeze(0)
+    out_ref.backward(grad)
+
+    fwd_err = (out - out_ref).abs().max().item()
+    dq_err = (q.grad - q_ref.grad).abs().max().item()
+    dk_err = (k.grad - k_ref.grad).abs().max().item()
+    dv_err = (v.grad - v_ref.grad).abs().max().item()
+
+    check("attn2 streaming backward fwd [513x64]", fwd_err < 0.02, f"max_err={fwd_err:.3e}")
+    check("attn2 streaming backward dQ [513x64]", dq_err < 0.05, f"max_err={dq_err:.3e}")
+    check("attn2 streaming backward dK [513x64]", dk_err < 0.05, f"max_err={dk_err:.3e}")
+    check("attn2 streaming backward dV [513x64]", dv_err < 0.05, f"max_err={dv_err:.3e}")
+
+
+#====================
 # 6. Attention2 batched: single-batch loop vs batched must match
 #====================
 
@@ -386,6 +980,95 @@ def test_attention2_batched_consistency():
 
     max_err = (out_batch - out_loop).abs().max().item()
     check(f"batched vs loop: max_err={max_err:.2e}", max_err < 1e-5, f"err={max_err}")
+
+
+#====================
+# attention2 batched forward contract: large streaming batched path must match native loop
+#====================
+
+def test_native_attention2_streaming_batched_forward_consistency():
+    print("\n=== test_native_attention2_streaming_batched_forward_consistency ===")
+    torch.manual_seed(59)
+    ext = load_native()
+    B, S, D = 2, 513, 48
+    dtypes = [torch.float32]
+    if torch.cuda.is_bf16_supported():
+        dtypes.append(torch.bfloat16)
+
+    for dtype in dtypes:
+        qx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        qy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        kx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        ky = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+
+        ox_batch, oy_batch = ext.attention2_cuda(qx, qy, kx, ky, vx, vy)
+        ox_loop = []
+        oy_loop = []
+        for b in range(B):
+            ox_b, oy_b = ext.attention2_cuda(
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            ox_loop.append(ox_b)
+            oy_loop.append(oy_b)
+        ox_ref = torch.stack(ox_loop, dim=0)
+        oy_ref = torch.stack(oy_loop, dim=0)
+
+        max_err = max((ox_batch - ox_ref).abs().max().item(), (oy_batch - oy_ref).abs().max().item())
+        tol = 1e-5 if dtype == torch.float32 else 2e-3
+        check(
+            f"native streaming batched attention forward matches native loop [{str(dtype).split('.')[-1]}]",
+            max_err < tol,
+            f"max_err={max_err:.3e}"
+        )
+
+
+#====================
+# attention2 batched backward contract: large streaming batched backward must match native loop
+#====================
+
+def test_native_attention2_streaming_batched_backward_consistency():
+    print("\n=== test_native_attention2_streaming_batched_backward_consistency ===")
+    torch.manual_seed(61)
+    ext = load_native()
+    B, S, D = 2, 513, 48
+    dtypes = [torch.float32]
+    if torch.cuda.is_bf16_supported():
+        dtypes.append(torch.bfloat16)
+
+    for dtype in dtypes:
+        qx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        qy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        kx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        ky = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vx = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        vy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        dox = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+        doy = torch.randn(B, S, D, device=DEVICE, dtype=torch.float32).to(dtype)
+
+        grads_batch = ext.attention_backward2_cuda(dox, doy, qx, qy, kx, ky, vx, vy)
+        grads_loop = [[] for _ in range(6)]
+        for b in range(B):
+            grads_b = ext.attention_backward2_cuda(
+                dox[b].contiguous(), doy[b].contiguous(),
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            for i, t in enumerate(grads_b):
+                grads_loop[i].append(t)
+        grads_ref = tuple(torch.stack(parts, dim=0) for parts in grads_loop)
+
+        max_err = max((gb - gr).abs().max().item() for gb, gr in zip(grads_batch, grads_ref))
+        tol = 1e-5 if dtype == torch.float32 else 2e-3
+        check(
+            f"native streaming batched attention backward matches native loop [{str(dtype).split('.')[-1]}]",
+            max_err < tol,
+            f"max_err={max_err:.3e}"
+        )
 
 
 #====================
@@ -492,6 +1175,68 @@ def test_native_attention2_backward_reuse_smoke():
             f"native attention backward scratch reuse keeps batched parity [{B}x{S}x{D}]",
             max_err < 1e-6,
             f"max_err={max_err:.3e}"
+        )
+
+
+def test_native_attention2_path_switch_reuse_smoke():
+    print("\n=== test_native_attention2_path_switch_reuse_smoke ===")
+    torch.manual_seed(62)
+    ext = load_native()
+
+    cases = [
+        (2, 513, 48, 1e-5),
+        (2, 24, 320, 1e-5),
+        (2, 513, 48, 1e-5),
+    ]
+
+    for B, S, D, tol in cases:
+        qx = torch.randn(B, S, D, device=DEVICE)
+        qy = torch.randn(B, S, D, device=DEVICE)
+        kx = torch.randn(B, S, D, device=DEVICE)
+        ky = torch.randn(B, S, D, device=DEVICE)
+        vx = torch.randn(B, S, D, device=DEVICE)
+        vy = torch.randn(B, S, D, device=DEVICE)
+        dox = torch.randn(B, S, D, device=DEVICE)
+        doy = torch.randn(B, S, D, device=DEVICE)
+
+        ox_batch, oy_batch = ext.attention2_cuda(qx, qy, kx, ky, vx, vy)
+        grads_batch = ext.attention_backward2_cuda(dox, doy, qx, qy, kx, ky, vx, vy)
+
+        ox_parts = []
+        oy_parts = []
+        grads_loop = [[] for _ in range(6)]
+        for b in range(B):
+            ox_b, oy_b = ext.attention2_cuda(
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            grads_b = ext.attention_backward2_cuda(
+                dox[b].contiguous(), doy[b].contiguous(),
+                qx[b].contiguous(), qy[b].contiguous(),
+                kx[b].contiguous(), ky[b].contiguous(),
+                vx[b].contiguous(), vy[b].contiguous(),
+            )
+            ox_parts.append(ox_b)
+            oy_parts.append(oy_b)
+            for i, t in enumerate(grads_b):
+                grads_loop[i].append(t)
+
+        ox_ref = torch.stack(ox_parts, dim=0)
+        oy_ref = torch.stack(oy_parts, dim=0)
+        grads_ref = tuple(torch.stack(parts, dim=0) for parts in grads_loop)
+
+        fwd_err = max((ox_batch - ox_ref).abs().max().item(), (oy_batch - oy_ref).abs().max().item())
+        bwd_err = max((gb - gr).abs().max().item() for gb, gr in zip(grads_batch, grads_ref))
+        check(
+            f"native attention path-switch forward reuse stays stable [{B}x{S}x{D}]",
+            fwd_err < tol,
+            f"max_err={fwd_err:.3e}"
+        )
+        check(
+            f"native attention path-switch backward reuse stays stable [{B}x{S}x{D}]",
+            bwd_err < tol,
+            f"max_err={bwd_err:.3e}"
         )
 
 
@@ -616,7 +1361,106 @@ def test_full_model_gradient_flow():
 
 
 #====================
-# 10. Overfit test: model must memorize 1 batch
+# 10. Forward split contract: internal hidden/logits helpers must reconstruct forward()
+#====================
+
+def test_model_forward_split_contract():
+    """_forward_hidden + _forward_logits should match full forward()"""
+    print("\n=== test_model_forward_split_contract ===")
+
+    modes = [("fp32", torch.float32, 1e-7, 1e-7)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("qts_fp32_rest_bf16", torch.bfloat16, 1e-5, 1e-6))
+
+    for mode, hidden_dtype, logits_tol, loss_tol in modes:
+        torch.manual_seed(126)
+        torch.cuda.manual_seed_all(126)
+
+        model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            precision_mode=mode,
+            device=DEVICE,
+        )
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+
+        logits_full, loss_full = model(tokens, targets=tokens)
+
+        with model._amp_context(tokens):
+            hidden = model._forward_hidden(tokens)
+            logits_split = model._forward_logits(hidden)
+            loss_split = F.cross_entropy(
+                logits_split.reshape(-1, logits_split.size(-1)),
+                tokens.reshape(-1),
+            )
+
+        max_diff = (logits_full.float() - logits_split.float()).abs().max().item()
+        loss_diff = abs(float(loss_full.detach().float()) - float(loss_split.detach().float()))
+
+        check(f"forward split hidden dtype [{mode}]", hidden.dtype == hidden_dtype, f"dtype={hidden.dtype}")
+        check(f"forward split logits parity [{mode}]", max_diff < logits_tol, f"max_diff={max_diff:.2e}")
+        check(f"forward split loss parity [{mode}]", loss_diff < loss_tol, f"loss_diff={loss_diff:.2e}")
+
+
+#====================
+# 11. Stepwise decode contract: block/model step APIs must match full-prefix evaluation
+#====================
+
+def test_stepwise_decode_contract():
+    """forward_step/decode_step should match full-prefix evaluation"""
+    print("\n=== test_stepwise_decode_contract ===")
+
+    modes = [("fp32", torch.float32, torch.float32, 1e-7)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("qts_fp32_rest_bf16", torch.bfloat16, torch.bfloat16, 1e-5))
+
+    for mode, hidden_dtype, logits_dtype, tol in modes:
+        torch.manual_seed(127)
+        torch.cuda.manual_seed_all(127)
+
+        model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            precision_mode=mode,
+            device=DEVICE,
+        )
+        tokens = torch.randint(0, 256, (2, 13), device=DEVICE)
+
+        logits_full, _ = model(tokens)
+        hidden_step = model.forward_step(tokens)
+        logits_step = model.decode_step(tokens)
+
+        with model._amp_context(tokens):
+            embedded = model._embed_tokens(tokens)
+            block_forward = model.blocks[0].forward(embedded)
+            block_step = model.blocks[0].forward_step(embedded)
+            hidden_full = model._forward_hidden(tokens)
+
+        block_diff = (block_forward.float() - block_step.float()).abs().max().item()
+        hidden_diff = (hidden_full[:, -1:, :].float() - hidden_step.float()).abs().max().item()
+        logits_diff = (logits_full[:, -1, :].float() - logits_step.float()).abs().max().item()
+
+        check(f"block forward_step parity [{mode}]", block_diff < tol, f"max_diff={block_diff:.2e}")
+        check(f"model forward_step dtype [{mode}]", hidden_step.dtype == hidden_dtype, f"dtype={hidden_step.dtype}")
+        check(f"model forward_step shape [{mode}]", tuple(hidden_step.shape) == (2, 1, model.hidden_dim), f"shape={tuple(hidden_step.shape)}")
+        check(f"model forward_step parity [{mode}]", hidden_diff < tol, f"max_diff={hidden_diff:.2e}")
+        check(f"model decode_step dtype [{mode}]", logits_step.dtype == logits_dtype, f"dtype={logits_step.dtype}")
+        check(f"model decode_step shape [{mode}]", tuple(logits_step.shape) == (2, model.vocab_size), f"shape={tuple(logits_step.shape)}")
+        check(f"model decode_step parity [{mode}]", logits_diff < tol, f"max_diff={logits_diff:.2e}")
+
+        empty = tokens[:, :0]
+        forward_msg = capture_runtime_error(lambda: model.forward_step(empty))
+        decode_msg = capture_runtime_error(lambda: model.decode_step(empty))
+        check(f"model forward_step rejects empty prefix [{mode}]", "at least one token" in forward_msg, forward_msg or "no RuntimeError")
+        check(f"model decode_step rejects empty prefix [{mode}]", "at least one token" in decode_msg, decode_msg or "no RuntimeError")
+
+
+#====================
+# 12. Overfit test: model must memorize 1 batch
 #====================
 
 def test_overfit_single_batch():
@@ -987,7 +1831,318 @@ def test_qitnn_linear_simplex_consistency():
 
 
 #====================
-# 14. Training convergence: AdamW param groups correctness
+# 14. QITNNLinear storage contract: private packed runtime view must preserve split public state
+#====================
+
+def test_qitnn_linear_packed_runtime_view_contract():
+    """private packed runtime view must not leak into public parameters, state, or diagnostics"""
+    print("\n=== test_qitnn_linear_packed_runtime_view_contract ===")
+    torch.manual_seed(34)
+
+    layer = pyqitnn.QITNNLinear(16, 8, device=DEVICE)
+    packed = layer._packed_weight_view()
+    state_keys = tuple(layer.state_dict().keys())
+    param_names = tuple(name for name, _ in layer.named_parameters())
+
+    check("packed runtime view shape", tuple(packed.shape) == (16, 8, 3), f"shape={tuple(packed.shape)}")
+    check("packed runtime view is contiguous", packed.is_contiguous(), f"stride={packed.stride()}")
+    check("packed runtime view keeps fp32 dtype", packed.dtype == torch.float32, f"dtype={packed.dtype}")
+    check("qitnn linear defaults to packed_reference backend", layer._runtime_backend == "packed_reference", f"backend={layer._runtime_backend}")
+    check("packed runtime view branch order keeps a_neg", torch.equal(packed[..., 0], layer.a_neg), "a_neg mismatch")
+    check("packed runtime view branch order keeps a_zero", torch.equal(packed[..., 1], layer.a_zero), "a_zero mismatch")
+    check("packed runtime view branch order keeps a_pos", torch.equal(packed[..., 2], layer.a_pos), "a_pos mismatch")
+    check("packed runtime view stays out of state_dict", state_keys == ("a_neg", "a_zero", "a_pos"), f"keys={state_keys}")
+    check("packed runtime view stays out of named_parameters", param_names == ("a_neg", "a_zero", "a_pos"), f"names={param_names}")
+
+    diag_split = pyqitnn.qitnn_diag_stats(layer.a_neg, layer.a_zero, layer.a_pos)
+    diag_packed = pyqitnn.qitnn_diag_stats(packed[..., 0], packed[..., 1], packed[..., 2])
+    diag_gap = max(abs(float(diag_split[key]) - float(diag_packed[key])) for key in QITNN_DIAG_STAT_KEYS)
+    check("packed runtime view preserves diagnostics semantics", diag_gap < 1e-12, f"diag_gap={diag_gap:.2e}")
+
+    with torch.no_grad():
+        layer.a_zero.add_(0.125)
+    packed_after = layer._packed_weight_view()
+    refresh_err = (packed_after[..., 1] - layer.a_zero).abs().max().item()
+    check("fresh packed runtime view reflects current split weights", refresh_err == 0.0, f"max_err={refresh_err:.2e}")
+
+
+#====================
+# 15. Model runtime backend default: constructors should stay on packed_reference
+#====================
+
+def test_model_default_runtime_backend_contract():
+    """new models should default every qitnn layer to packed_reference"""
+    print("\n=== test_model_default_runtime_backend_contract ===")
+    torch.manual_seed(35)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24,
+        ffn_dim=48,
+        seq_len=16,
+        layers=2,
+        device=DEVICE,
+    )
+    backend_names = tuple(layer._runtime_backend for _, _, layer in model.iter_qitnn_layers())
+    check(
+        "model defaults every qitnn layer to packed_reference",
+        backend_names == ("packed_reference",) * len(backend_names),
+        f"backends={backend_names}",
+    )
+
+
+#====================
+# 16. QITNNLinear runtime backend contract: split and packed_reference must stay interchangeable
+#====================
+
+def test_qitnn_linear_runtime_backend_parity():
+    """QITNNLinear internal runtime backend switch must preserve visible and raw outputs"""
+    print("\n=== test_qitnn_linear_runtime_backend_parity ===")
+    torch.manual_seed(35)
+
+    modes = [("fp32", False, torch.float32)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("mixed", True, torch.bfloat16))
+
+    for label, use_mixed, visible_dtype in modes:
+        layer = pyqitnn.QITNNLinear(16, 8, centered_simplex=True, mixed_precision=use_mixed, device=DEVICE)
+        inp_dtype = torch.float32 if not use_mixed else torch.float32
+        inp = torch.randn(4, 16, device=DEVICE, dtype=inp_dtype)
+
+        layer._set_runtime_backend("split")
+        packed_split, raw_split = layer(inp), layer.forward_raw(inp)
+        layer._set_runtime_backend("packed_reference")
+        packed_ref, raw_ref = layer(inp), layer.forward_raw(inp)
+
+        packed_diff = (packed_split.float() - packed_ref.float()).abs().max().item()
+        check(f"layer backend packed output parity [{label}]", packed_diff < 1e-6, f"max_diff={packed_diff:.2e}")
+        check(f"layer backend visible dtype [{label}]", packed_ref.dtype == visible_dtype, f"dtype={packed_ref.dtype}")
+
+        for name, left, right in zip(("u", "v", "cn", "cz", "cp"), raw_split, raw_ref):
+            max_err = (left.float() - right.float()).abs().max().item()
+            check(f"layer backend raw parity {name} [{label}]", max_err < 1e-6, f"max_err={max_err:.2e}")
+
+        layer._set_runtime_backend("split")
+
+
+#====================
+# 17. QITNNLinear runtime backend contract: packed_reference must preserve backward reachability
+#====================
+
+def test_qitnn_linear_runtime_backend_backward_parity():
+    """packed runtime backend must return gradients to split parameters and input"""
+    print("\n=== test_qitnn_linear_runtime_backend_backward_parity ===")
+    torch.manual_seed(38)
+
+    modes: list[tuple[str, bool, torch.dtype, float, float]] = [("fp32", False, torch.float32, 1e-5, 1e-5)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("mixed", True, torch.float32, 1e-2, 5e-4))
+
+    for label, use_mixed, input_dtype, inp_tol, weight_tol in modes:
+        split_layer = pyqitnn.QITNNLinear(
+            16,
+            8,
+            ent_lambda=0.19,
+            centered_simplex=True,
+            mixed_precision=use_mixed,
+            device=DEVICE,
+        )
+        packed_layer = pyqitnn.QITNNLinear(
+            16,
+            8,
+            ent_lambda=0.19,
+            centered_simplex=True,
+            mixed_precision=use_mixed,
+            device=DEVICE,
+        )
+        packed_layer.load_state_dict(split_layer.state_dict())
+        packed_layer._set_runtime_backend("packed_reference")
+
+        split_inp = torch.randn(5, 16, device=DEVICE, dtype=input_dtype, requires_grad=True)
+        packed_inp = split_inp.detach().clone().requires_grad_(True)
+
+        split_out = split_layer(split_inp)
+        packed_out = packed_layer(packed_inp)
+        split_loss = split_out.float().square().mean()
+        packed_loss = packed_out.float().square().mean()
+        split_loss.backward()
+        packed_loss.backward()
+
+        check(f"layer backend backward input grad exists [{label}]", packed_inp.grad is not None, "grad is None")
+        check(f"layer backend backward reaches a_neg [{label}]", packed_layer.a_neg.grad is not None, "grad is None")
+        check(f"layer backend backward reaches a_zero [{label}]", packed_layer.a_zero.grad is not None, "grad is None")
+        check(f"layer backend backward reaches a_pos [{label}]", packed_layer.a_pos.grad is not None, "grad is None")
+        if (
+            packed_inp.grad is None or
+            packed_layer.a_neg.grad is None or
+            packed_layer.a_zero.grad is None or
+            packed_layer.a_pos.grad is None
+        ):
+            continue
+
+        inp_err = (split_inp.grad.float() - packed_inp.grad.float()).abs().max().item()
+        neg_err = (split_layer.a_neg.grad - packed_layer.a_neg.grad).abs().max().item()
+        zero_err = (split_layer.a_zero.grad - packed_layer.a_zero.grad).abs().max().item()
+        pos_err = (split_layer.a_pos.grad - packed_layer.a_pos.grad).abs().max().item()
+        finite_ok = all(
+            torch.isfinite(t.float()).all().item()
+            for t in (
+                packed_inp.grad,
+                packed_layer.a_neg.grad,
+                packed_layer.a_zero.grad,
+                packed_layer.a_pos.grad,
+            )
+        )
+
+        check(f"layer backend backward input grad dtype [{label}]", packed_inp.grad.dtype == input_dtype, f"dtype={packed_inp.grad.dtype}")
+        check(f"layer backend backward input parity [{label}]", inp_err < inp_tol, f"max_err={inp_err:.2e}")
+        check(f"layer backend backward a_neg parity [{label}]", neg_err < weight_tol, f"max_err={neg_err:.2e}")
+        check(f"layer backend backward a_zero parity [{label}]", zero_err < weight_tol, f"max_err={zero_err:.2e}")
+        check(f"layer backend backward a_pos parity [{label}]", pos_err < weight_tol, f"max_err={pos_err:.2e}")
+        check(f"layer backend backward stays finite [{label}]", finite_ok)
+
+
+#====================
+# 18. Model runtime backend contract: internal backend switch must preserve full-model outputs
+#====================
+
+def test_model_runtime_backend_parity():
+    """model-level runtime backend switch must preserve logits and loss"""
+    print("\n=== test_model_runtime_backend_parity ===")
+
+    modes = [("fp32", "fp32", 5e-5, 1e-6)]
+    if torch.cuda.is_bf16_supported():
+        modes.append(("mixed", "qts_fp32_rest_bf16", 1e-5, 1e-6))
+
+    for label, precision_mode, logits_tol, loss_tol in modes:
+        torch.manual_seed(36)
+        torch.cuda.manual_seed_all(36)
+
+        model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            precision_mode=precision_mode,
+            device=DEVICE,
+        )
+        tokens = torch.randint(0, 256, (2, 16), device=DEVICE)
+
+        model._set_qitnn_runtime_backend("split")
+        logits_split, loss_split = model(tokens, targets=tokens)
+
+        model._set_qitnn_runtime_backend("packed_reference")
+        logits_ref, loss_ref = model(tokens, targets=tokens)
+        backend_names = tuple(layer._runtime_backend for _, _, layer in model.iter_qitnn_layers())
+
+        logits_diff = (logits_split.float() - logits_ref.float()).abs().max().item()
+        loss_diff = abs(float(loss_split.detach().float()) - float(loss_ref.detach().float()))
+
+        check(f"model backend switches every qitnn layer [{label}]", backend_names == ("packed_reference",) * len(backend_names), f"backends={backend_names}")
+        check(f"model backend logits parity [{label}]", logits_diff < logits_tol, f"max_diff={logits_diff:.2e}")
+        check(f"model backend loss parity [{label}]", loss_diff < loss_tol, f"loss_diff={loss_diff:.2e}")
+
+        model._set_qitnn_runtime_backend("split")
+        reset_names = tuple(layer._runtime_backend for _, _, layer in model.iter_qitnn_layers())
+        check(f"model backend returns to split [{label}]", reset_names == ("split",) * len(reset_names), f"backends={reset_names}")
+
+
+#====================
+# 19. Runtime backend contract: invalid backend names must fail loudly
+#====================
+
+def test_runtime_backend_rejects_invalid_name():
+    """internal runtime backend selector should reject unsupported backend names"""
+    print("\n=== test_runtime_backend_rejects_invalid_name ===")
+    torch.manual_seed(37)
+
+    layer = pyqitnn.QITNNLinear(16, 8, device=DEVICE)
+    model = pyqitnn.QITNNSimplexTransformerLM(dim=16, ffn_dim=32, seq_len=16, layers=1, device=DEVICE)
+
+    layer_msg = capture_runtime_error(lambda: layer._set_runtime_backend("bad_backend"))
+    model_msg = capture_runtime_error(lambda: model._set_qitnn_runtime_backend("bad_backend"))
+
+    check("layer backend selector rejects invalid backend", "split" in layer_msg and "packed_reference" in layer_msg, layer_msg or "no RuntimeError")
+    check("model backend selector rejects invalid backend", "split" in model_msg and "packed_reference" in model_msg, model_msg or "no RuntimeError")
+
+
+#====================
+# 20. Product contract: internal runtime backend must stay invisible to checkpoint/diagnostics/generation
+#====================
+
+def test_runtime_backend_product_surface_contract():
+    """internal packed runtime backend must stay invisible to product-facing contracts"""
+    print("\n=== test_runtime_backend_product_surface_contract ===")
+    torch.manual_seed(39)
+    torch.cuda.manual_seed_all(39)
+
+    ckpt_path = ROOT / "_test_runtime_backend_product_ckpt.pt"
+    try:
+        split_model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            device=DEVICE,
+        )
+        packed_model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            device=DEVICE,
+        )
+        packed_model.load_state_dict(split_model.state_dict())
+        packed_model._set_qitnn_runtime_backend("packed_reference")
+
+        state_keys_split = tuple(split_model.state_dict().keys())
+        state_keys_packed = tuple(packed_model.state_dict().keys())
+        diag_split = split_model.collect_qitnn_diagnostics(epoch=4, full=True)
+        diag_packed = packed_model.collect_qitnn_diagnostics(epoch=4, full=True)
+        fmt_split = split_model.format_qitnn_diagnostics(epoch=4, full=True)
+        fmt_packed = packed_model.format_qitnn_diagnostics(epoch=4, full=True)
+
+        check("packed runtime backend stays out of model state_dict", state_keys_packed == state_keys_split, f"keys={state_keys_packed}")
+        check("packed runtime backend preserves diagnostics snapshot", diag_packed == diag_split, json.dumps(diag_packed, ensure_ascii=False))
+        check("packed runtime backend preserves formatted diagnostics", fmt_packed == fmt_split, "\n".join(fmt_packed))
+
+        opt = torch.optim.AdamW(packed_model.parameters(), lr=1e-3)
+        save_ckpt(ckpt_path, packed_model, opt, epoch=2, step=11, best_val=1.5, best_val_epoch=1)
+        ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+
+        loaded_model = pyqitnn.QITNNSimplexTransformerLM(
+            dim=24,
+            ffn_dim=48,
+            seq_len=16,
+            layers=2,
+            device=DEVICE,
+        )
+        loaded_opt = torch.optim.AdamW(loaded_model.parameters(), lr=1e-3)
+        load_msg = capture_runtime_error(lambda: load_ckpt(ckpt_path, loaded_model, loaded_opt, DEVICE))
+        loaded_backends = tuple(layer._runtime_backend for _, _, layer in loaded_model.iter_qitnn_layers())
+
+        check("checkpoint saved from packed runtime backend still loads", load_msg == "", load_msg or "ok")
+        check("checkpoint payload keeps public tensor-only model keys", tuple(ckpt["model"].keys()) == state_keys_split, f"keys={tuple(ckpt['model'].keys())}")
+        check("loaded model returns to packed_reference runtime backend", loaded_backends == ("packed_reference",) * len(loaded_backends), f"backends={loaded_backends}")
+
+        tokens = torch.randint(0, 256, (2, 13), device=DEVICE)
+        greedy_packed = packed_model.generate(tokens, max_new_tokens=10, temperature=0.0, top_k=0, ascii_guard=False)
+        greedy_loaded = loaded_model.generate(tokens, max_new_tokens=10, temperature=0.0, top_k=0, ascii_guard=False)
+        logits_packed, loss_packed = packed_model(tokens, targets=tokens)
+        logits_loaded, loss_loaded = loaded_model(tokens, targets=tokens)
+        logits_diff = (logits_packed.float() - logits_loaded.float()).abs().max().item()
+        loss_diff = abs(float(loss_packed.detach().float()) - float(loss_loaded.detach().float()))
+        logits_tol = 6e-5
+
+        check("checkpointed packed backend preserves greedy generation", torch.equal(greedy_packed, greedy_loaded), f"packed={greedy_packed.tolist()} loaded={greedy_loaded.tolist()}")
+        check("checkpointed packed backend preserves forward logits", logits_diff < logits_tol, f"max_diff={logits_diff:.2e}")
+        check("checkpointed packed backend preserves loss", loss_diff < 1e-6, f"loss_diff={loss_diff:.2e}")
+    finally:
+        if ckpt_path.exists():
+            ckpt_path.unlink()
+
+
+#====================
+# 20. Training convergence: AdamW param groups correctness
 #====================
 
 def test_adamw_param_groups():
@@ -1068,7 +2223,132 @@ def test_generation_sanity():
 
 
 #====================
-# 16. Mixed generation: inference path must stay on the conservative bf16 contract
+# 16. Generation parity: generate() must match the reference decode loop
+#====================
+
+def test_generation_reference_loop_parity_fp32():
+    """generate() should match the reference decode loop in fp32"""
+    print("\n=== test_generation_reference_loop_parity_fp32 ===")
+    torch.manual_seed(123)
+    torch.cuda.manual_seed_all(123)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24, ffn_dim=48, seq_len=16, layers=2, device=DEVICE,
+    )
+    prompt = torch.randint(0, 256, (2, 11), device=DEVICE)
+
+    cases = [
+        ("sampled", 12, 0.8, 8, True),
+        ("greedy", 10, 0.0, 0, False),
+    ]
+
+    for label, max_new_tokens, temperature, top_k, ascii_guard in cases:
+        rng_state = _capture_rng_state()
+        out_ref = _generate_reference_loop(
+            model,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            ascii_guard=ascii_guard,
+        )
+        restored = _restore_rng_state(rng_state)
+        out_now = model.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            ascii_guard=ascii_guard,
+        )
+
+        check(f"generation reference loop restores RNG [{label}]", restored, "restore failed")
+        check(
+            f"generate() matches reference loop [{label}]",
+            torch.equal(out_now, out_ref),
+            f"out_now={out_now.tolist()} out_ref={out_ref.tolist()}",
+        )
+
+
+#====================
+# 17. Generation routing: generate() must use decode_step(), not forward()
+#====================
+
+def test_generate_uses_decode_step_contract():
+    """generate() should route through decode_step() for each new token"""
+    print("\n=== test_generate_uses_decode_step_contract ===")
+    torch.manual_seed(126)
+    torch.cuda.manual_seed_all(126)
+
+    class TrackingTransformer(pyqitnn.QITNNSimplexTransformerLM):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.forward_calls = 0
+            self.decode_step_calls = 0
+
+        def forward(self, tokens: torch.Tensor, *, targets: torch.Tensor | None = None):
+            self.forward_calls += 1
+            raise RuntimeError("generate() should not call forward()")
+
+        def decode_step(self, tokens: torch.Tensor) -> torch.Tensor:
+            self.decode_step_calls += 1
+            return super().decode_step(tokens)
+
+    model = TrackingTransformer(
+        dim=24, ffn_dim=48, seq_len=8, layers=2, device=DEVICE,
+    )
+    prompt = torch.randint(0, 256, (2, 11), device=DEVICE)
+
+    out = model.generate(
+        prompt,
+        max_new_tokens=5,
+        temperature=0.0,
+        top_k=0,
+        ascii_guard=False,
+    )
+
+    check("generate() appends the requested number of tokens", out.shape == (2, 16), f"shape={tuple(out.shape)}")
+    check("generate() does not route through forward()", model.forward_calls == 0, f"forward_calls={model.forward_calls}")
+    check("generate() calls decode_step() once per generated token", model.decode_step_calls == 5, f"decode_step_calls={model.decode_step_calls}")
+
+
+#====================
+# 18. Generation window: only the last seq_len tokens may affect decode
+#====================
+
+def test_generation_seq_len_window_contract():
+    """generate() should depend only on the visible decode window"""
+    print("\n=== test_generation_seq_len_window_contract ===")
+    torch.manual_seed(124)
+    torch.cuda.manual_seed_all(124)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24, ffn_dim=48, seq_len=8, layers=2, device=DEVICE,
+    )
+
+    shared_tail = torch.tensor([[41, 42, 43, 44, 45, 46, 47, 48]], device=DEVICE, dtype=torch.long)
+    prompt_a = torch.tensor([[7, 9, 11, 13, 17, 19, 23, 29]], device=DEVICE, dtype=torch.long)
+    prompt_a = torch.cat([prompt_a, shared_tail], dim=1)
+    prompt_b = torch.tensor([[101, 103, 107, 109, 113, 127, 131, 137, 139]], device=DEVICE, dtype=torch.long)
+    prompt_b = torch.cat([prompt_b, shared_tail], dim=1)
+
+    rng_state = _capture_rng_state()
+    out_a = model.generate(prompt_a, max_new_tokens=12, temperature=0.8, top_k=8, ascii_guard=True)
+    restored = _restore_rng_state(rng_state)
+    out_b = model.generate(prompt_b, max_new_tokens=12, temperature=0.8, top_k=8, ascii_guard=True)
+
+    cont_a = out_a[:, prompt_a.size(1):]
+    cont_b = out_b[:, prompt_b.size(1):]
+
+    check("generation window test restores RNG", restored, "restore failed")
+    check(
+        "generation continuation depends only on the visible seq_len tail",
+        torch.equal(cont_a, cont_b),
+        f"cont_a={cont_a.tolist()} cont_b={cont_b.tolist()}",
+    )
+
+
+#====================
+# 19. Mixed generation parity: bf16 visible path must match the reference decode loop
 #====================
 
 def test_mixed_precision_generation_sanity():
@@ -1107,8 +2387,50 @@ def test_mixed_precision_generation_sanity():
           f"invalid tokens: {invalid[:10]}")
 
 
+def test_generation_reference_loop_parity_mixed_precision():
+    """mixed generate() should match the reference decode loop"""
+    print("\n=== test_generation_reference_loop_parity_mixed_precision ===")
+    if not torch.cuda.is_bf16_supported():
+        warn("mixed generation reference parity skipped", "bf16 not supported on this GPU")
+        return
+
+    torch.manual_seed(125)
+    torch.cuda.manual_seed_all(125)
+
+    model = pyqitnn.QITNNSimplexTransformerLM(
+        dim=24, ffn_dim=48, seq_len=16, layers=2, device=DEVICE, mixed_precision=True,
+    )
+    prompt = torch.randint(0, 256, (2, 13), device=DEVICE)
+
+    rng_state = _capture_rng_state()
+    out_ref = _generate_reference_loop(
+        model,
+        prompt,
+        max_new_tokens=12,
+        temperature=0.8,
+        top_k=8,
+        ascii_guard=True,
+    )
+    restored = _restore_rng_state(rng_state)
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        out_now = model.generate(
+            prompt,
+            max_new_tokens=12,
+            temperature=0.8,
+            top_k=8,
+            ascii_guard=True,
+        )
+
+    check("mixed generation reference parity restores RNG", restored, "restore failed")
+    check(
+        "mixed generate() matches reference loop",
+        torch.equal(out_now, out_ref),
+        f"out_now={out_now.tolist()} out_ref={out_ref.tolist()}",
+    )
+
+
 #====================
-# 17. Mixed guardrails: invalid high-level mixed usage must fail loudly
+# 20. Mixed guardrails: invalid high-level mixed usage must fail loudly
 #====================
 
 def test_mixed_precision_guardrails():
@@ -4666,16 +5988,33 @@ if __name__ == "__main__":
     t0 = time.time()
 
     test_born_rule_sum()
+    test_forward3_raw_channel_projection_contract()
+    test_forward3_raw_channel_simplex_contract()
+    test_forward3_mixed_raw_channel_contract()
+    test_forward3_split_backward_native_contract()
+    test_forward3_packed_reference_parity()
+    test_forward3_packed_reference_mixed_parity()
+    test_forward3_packed_reference_raw_projection_contract()
+    test_forward3_packed_reference_fused_epilogue_contract()
+    test_forward3_packed_reference_rejects_bad_layout()
+    test_forward3_packed_reference_backward_parity()
     test_simplex_triangle_vertices()
     test_centered_simplex_backward_fd()
     test_backnorm_full_fd()
     test_attention2_vs_sdpa()
+    test_attention2_streaming_forward_large_seq_contract()
+    test_attention2_streaming_backward_large_seq_contract()
     test_attention2_batched_consistency()
+    test_native_attention2_streaming_batched_forward_consistency()
+    test_native_attention2_streaming_batched_backward_consistency()
     test_native_attention2_batched_bridge_consistency()
     test_native_attention2_backward_reuse_smoke()
+    test_native_attention2_path_switch_reuse_smoke()
     test_prior_raises_entropy()
     test_prior_no_overshoot()
     test_full_model_gradient_flow()
+    test_model_forward_split_contract()
+    test_stepwise_decode_contract()
     test_overfit_single_batch()
     test_checkpoint_roundtrip()
     test_rng_state_helper_roundtrip()
@@ -4685,9 +6024,20 @@ if __name__ == "__main__":
     test_checkpoint_restore_preserves_generation_rng()
     test_extreme_amplitude_scales()
     test_qitnn_linear_simplex_consistency()
+    test_qitnn_linear_packed_runtime_view_contract()
+    test_model_default_runtime_backend_contract()
+    test_qitnn_linear_runtime_backend_parity()
+    test_qitnn_linear_runtime_backend_backward_parity()
+    test_model_runtime_backend_parity()
+    test_runtime_backend_rejects_invalid_name()
+    test_runtime_backend_product_surface_contract()
     test_adamw_param_groups()
     test_generation_sanity()
+    test_generation_reference_loop_parity_fp32()
+    test_generate_uses_decode_step_contract()
+    test_generation_seq_len_window_contract()
     test_mixed_precision_generation_sanity()
+    test_generation_reference_loop_parity_mixed_precision()
     test_mixed_precision_guardrails()
     test_mixed_precision_default_stays_fp32()
     test_qitnn_linear_mixed_precision_smoke()

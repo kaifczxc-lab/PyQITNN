@@ -253,6 +253,35 @@ QITNN_API void Qitnn_DeviceForward3Ex(
     int out_dim
 );
 
+QITNN_API void Qitnn_DeviceForward3PackedEx(
+    const void* d_input,
+    int input_dtype,
+    const float* d_a_packed,
+    void* d_out_u,
+    void* d_out_v,
+    int uv_dtype,
+    float* d_out_cn,
+    float* d_out_cz,
+    float* d_out_cp,
+    int rows,
+    int in_dim,
+    int out_dim
+);
+
+QITNN_API void Qitnn_DeviceBackward3PackedEx(
+    const void* d_input,
+    int input_dtype,
+    const float* d_a_packed,
+    const float* d_dcn,
+    const float* d_dcz,
+    const float* d_dcp,
+    void* d_out_input_grad,
+    float* d_out_a_packed_grad,
+    int rows,
+    int in_dim,
+    int out_dim
+);
+
 #ifdef __cplusplus
 }
 #endif

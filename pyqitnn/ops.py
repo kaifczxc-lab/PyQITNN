@@ -59,6 +59,19 @@ def _require_amp_compatible_packed(t: torch.Tensor, name: str) -> None:
         raise RuntimeError(f"{name} last dim must be even")
 
 
+def _require_f32_ternary_weight_packed(t: torch.Tensor, name: str) -> None:
+    if not t.is_cuda:
+        raise RuntimeError(f"{name} must be a CUDA tensor")
+    if t.dtype != torch.float32:
+        raise RuntimeError(f"{name} must be float32")
+    if t.dim() != 3:
+        raise RuntimeError(f"{name} must be 3D")
+    if not t.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous")
+    if t.size(-1) != 3:
+        raise RuntimeError(f"{name} last dim must be 3")
+
+
 #====================
 # simplex channel helpers (internal)
 #====================
@@ -107,17 +120,58 @@ class _Forward3Fn(torch.autograd.Function):
             dcp = dcp + grad_cp.contiguous().to(dtype=torch.float32)
 
         g_inp = None
-        if ctx.needs_input_grad[0]:
-            g_inp = dcn @ a_neg.t() + dcz @ a_zero.t() + dcp @ a_pos.t()
-            if ctx.input_dtype != torch.float32:
-                g_inp = g_inp.to(dtype=ctx.input_dtype)
-
-        inp_fp32 = inp if inp.dtype == torch.float32 else inp.to(dtype=torch.float32)
-        g_neg  = inp_fp32.t() @ dcn if ctx.needs_input_grad[1] else None
-        g_zero = inp_fp32.t() @ dcz if ctx.needs_input_grad[2] else None
-        g_pos  = inp_fp32.t() @ dcp if ctx.needs_input_grad[3] else None
+        g_neg = None
+        g_zero = None
+        g_pos = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1] or ctx.needs_input_grad[2] or ctx.needs_input_grad[3]:
+            a_packed = torch.stack((a_neg, a_zero, a_pos), dim=-1).contiguous()
+            g_inp_native, g_packed_native = ext.backward3_packed_cuda(inp, a_packed, dcn, dcz, dcp)
+            g_inp = g_inp_native if ctx.needs_input_grad[0] else None
+            g_neg = g_packed_native[..., 0].contiguous() if ctx.needs_input_grad[1] else None
+            g_zero = g_packed_native[..., 1].contiguous() if ctx.needs_input_grad[2] else None
+            g_pos = g_packed_native[..., 2].contiguous() if ctx.needs_input_grad[3] else None
 
         return g_inp, g_neg, g_zero, g_pos, None, None
+
+
+class _Forward3PackedReferenceFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp, a_packed, ent_lambda, mixed_precision):
+        ext = load_native()
+        u, v, cn, cz, cp = ext.forward3_packed_cuda(inp, a_packed)
+        ctx.save_for_backward(inp, a_packed, cn, cz, cp)
+        ctx.ent_lambda = float(ent_lambda)
+        ctx.input_dtype = inp.dtype
+        ctx.mixed_precision = bool(mixed_precision)
+        return u, v, cn, cz, cp
+
+    @staticmethod
+    def backward(ctx, grad_u, grad_v, grad_cn, grad_cz, grad_cp):
+        inp, a_packed, cn, cz, cp = ctx.saved_tensors
+        ext = load_native()
+
+        grad_u = grad_u.contiguous() if grad_u is not None else torch.zeros_like(cn)
+        grad_v = grad_v.contiguous() if grad_v is not None else torch.zeros_like(cn)
+
+        dcn, dcz, dcp = ext.backnorm3_cuda(
+            grad_u, grad_v, cn, cz, cp, ctx.ent_lambda,
+        )
+
+        if grad_cn is not None:
+            dcn = dcn + grad_cn.contiguous().to(dtype=torch.float32)
+        if grad_cz is not None:
+            dcz = dcz + grad_cz.contiguous().to(dtype=torch.float32)
+        if grad_cp is not None:
+            dcp = dcp + grad_cp.contiguous().to(dtype=torch.float32)
+
+        g_inp = None
+        g_packed = None
+        if ctx.needs_input_grad[0] or ctx.needs_input_grad[1]:
+            g_inp_native, g_packed_native = ext.backward3_packed_cuda(inp, a_packed, dcn, dcz, dcp)
+            g_inp = g_inp_native if ctx.needs_input_grad[0] else None
+            g_packed = g_packed_native if ctx.needs_input_grad[1] else None
+
+        return g_inp, g_packed, None, None
 
 
 #====================
@@ -214,6 +268,25 @@ def forward3(
     _require_f32_2d(a_zero, "a_zero")
     _require_f32_2d(a_pos, "a_pos")
     return _Forward3Fn.apply(inp, a_neg, a_zero, a_pos, float(ent_lambda), use_mixed_precision)
+
+
+def forward3_packed_reference(
+    inp: torch.Tensor,
+    a_packed: torch.Tensor,
+    *,
+    ent_lambda: float = 0.0,
+    mixed_precision: bool | None = None,
+    precision_mode: str | None = None,
+):
+    _, use_mixed_precision = _resolve_precision_mode_args(precision_mode, mixed_precision)
+    if use_mixed_precision:
+        _require_amp_compatible_2d(inp, "inp")
+    else:
+        _require_f32_2d(inp, "inp")
+    _require_f32_ternary_weight_packed(a_packed, "a_packed")
+    if inp.size(1) != a_packed.size(0):
+        raise RuntimeError("inp.size(1) must match a_packed.size(0)")
+    return _Forward3PackedReferenceFn.apply(inp, a_packed, float(ent_lambda), use_mixed_precision)
 
 
 def prior_(

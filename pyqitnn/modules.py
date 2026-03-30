@@ -5,6 +5,7 @@ from torch import nn
 
 from .ops import centered_simplex
 from .ops import forward3
+from .ops import forward3_packed_reference
 from .precision import normalize_precision_mode as _normalize_precision_mode
 from .precision import resolve_precision_mode as _resolve_precision_mode_args
 
@@ -41,6 +42,7 @@ class QITNNLinear(nn.Module):
             precision_mode,
             mixed_precision,
         )
+        self._runtime_backend = "packed_reference"
 
         kw = {"device": device, "dtype": dtype}
         self.a_neg  = nn.Parameter(torch.empty((self.in_dim, self.out_dim), **kw))
@@ -53,6 +55,16 @@ class QITNNLinear(nn.Module):
         nn.init.normal_(self.a_neg,  mean=0.0, std=self.init_std)
         nn.init.normal_(self.a_zero, mean=0.0, std=self.init_std)
         nn.init.normal_(self.a_pos,  mean=0.0, std=self.init_std)
+
+    def _packed_weight_view(self) -> torch.Tensor:
+        # runtime-only ternary layout; public storage stays split for state_dict and diagnostics
+        return torch.stack((self.a_neg, self.a_zero, self.a_pos), dim=-1).contiguous()
+
+    def _set_runtime_backend(self, backend: str) -> None:
+        normalized = str(backend).strip().lower()
+        if normalized not in ("split", "packed_reference"):
+            raise RuntimeError("backend must be 'split' or 'packed_reference'")
+        self._runtime_backend = normalized
 
     #====================
     # forward passes
@@ -85,14 +97,23 @@ class QITNNLinear(nn.Module):
                 "Do not call .half() or .bfloat16() on QITNN parameters."
             )
         inp = self._maybe_cast_activation(inp)
-        return forward3(
-            inp,
-            self.a_neg,
-            self.a_zero,
-            self.a_pos,
-            ent_lambda=self.ent_lambda,
-            mixed_precision=self.mixed_precision,
-        )
+        if self._runtime_backend == "split":
+            return forward3(
+                inp,
+                self.a_neg,
+                self.a_zero,
+                self.a_pos,
+                ent_lambda=self.ent_lambda,
+                mixed_precision=self.mixed_precision,
+            )
+        if self._runtime_backend == "packed_reference":
+            return forward3_packed_reference(
+                inp,
+                self._packed_weight_view(),
+                ent_lambda=self.ent_lambda,
+                mixed_precision=self.mixed_precision,
+            )
+        raise RuntimeError(f"unsupported runtime backend: {self._runtime_backend}")
 
     def forward_visible(self, inp: torch.Tensor):
         u, v, cn, cz, cp = self.forward_raw(inp)

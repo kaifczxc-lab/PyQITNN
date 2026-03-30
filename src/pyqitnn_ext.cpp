@@ -39,6 +39,14 @@ void check_cuda_amp_2d_or_3d(const torch::Tensor& t, const char* name) {
     TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
 }
 
+void check_cuda_f32_ternary_packed(const torch::Tensor& t, const char* name) {
+    TORCH_CHECK(t.is_cuda(), name, " must be a CUDA tensor");
+    TORCH_CHECK(t.scalar_type() == torch::kFloat32, name, " must be float32");
+    TORCH_CHECK(t.dim() == 3, name, " must be 3D");
+    TORCH_CHECK(t.size(2) == 3, name, " last dim must be 3");
+    TORCH_CHECK(t.is_contiguous(), name, " must be contiguous");
+}
+
 void check_same_shape(const torch::Tensor& a, const torch::Tensor& b, const char* a_name, const char* b_name) {
     TORCH_CHECK(a.sizes() == b.sizes(), a_name, " shape must match ", b_name);
 }
@@ -108,6 +116,94 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     );
 
     return {out_u, out_v, out_cn, out_cz, out_cp};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward3_packed_cuda(
+    torch::Tensor input,
+    torch::Tensor a_packed
+) {
+    check_cuda_amp_2d(input, "input");
+    check_cuda_f32_ternary_packed(a_packed, "a_packed");
+
+    TORCH_CHECK(input.size(1) == a_packed.size(0), "input.size(1) must match a_packed.size(0)");
+    TORCH_CHECK(input.get_device() == 0, "stage3 packed bridge currently supports only cuda:0");
+    TORCH_CHECK(a_packed.get_device() == 0, "stage3 packed bridge currently supports only cuda:0");
+
+    const auto rows = static_cast<int>(input.size(0));
+    const auto in_dim = static_cast<int>(input.size(1));
+    const auto out_dim = static_cast<int>(a_packed.size(1));
+
+    auto out_u = torch::empty({rows, out_dim}, input.options());
+    auto out_v = torch::empty({rows, out_dim}, input.options());
+    auto fp32_opts = input.options().dtype(torch::kFloat32);
+    auto out_cn = torch::empty({rows, out_dim}, fp32_opts);
+    auto out_cz = torch::empty({rows, out_dim}, fp32_opts);
+    auto out_cp = torch::empty({rows, out_dim}, fp32_opts);
+
+    Qitnn_DeviceForward3PackedEx(
+        input.data_ptr(),
+        tensor_dtype_code(input),
+        a_packed.data_ptr<float>(),
+        out_u.data_ptr(),
+        out_v.data_ptr(),
+        tensor_dtype_code(out_u),
+        out_cn.data_ptr<float>(),
+        out_cz.data_ptr<float>(),
+        out_cp.data_ptr<float>(),
+        rows,
+        in_dim,
+        out_dim
+    );
+
+    return {out_u, out_v, out_cn, out_cz, out_cp};
+}
+
+std::tuple<torch::Tensor, torch::Tensor> backward3_packed_cuda(
+    torch::Tensor input,
+    torch::Tensor a_packed,
+    torch::Tensor dcn,
+    torch::Tensor dcz,
+    torch::Tensor dcp
+) {
+    check_cuda_amp_2d(input, "input");
+    check_cuda_f32_ternary_packed(a_packed, "a_packed");
+    check_cuda_f32_2d(dcn, "dcn");
+    check_cuda_f32_2d(dcz, "dcz");
+    check_cuda_f32_2d(dcp, "dcp");
+
+    TORCH_CHECK(input.size(1) == a_packed.size(0), "input.size(1) must match a_packed.size(0)");
+    TORCH_CHECK(dcn.size(0) == input.size(0), "dcn.size(0) must match input.size(0)");
+    TORCH_CHECK(dcn.size(1) == a_packed.size(1), "dcn.size(1) must match a_packed.size(1)");
+    TORCH_CHECK(dcn.sizes() == dcz.sizes(), "dcz shape must match dcn");
+    TORCH_CHECK(dcn.sizes() == dcp.sizes(), "dcp shape must match dcn");
+    TORCH_CHECK(input.get_device() == 0, "packed backward bridge currently supports only cuda:0");
+    TORCH_CHECK(a_packed.get_device() == 0, "packed backward bridge currently supports only cuda:0");
+    TORCH_CHECK(dcn.get_device() == 0, "packed backward bridge currently supports only cuda:0");
+    TORCH_CHECK(dcz.get_device() == 0, "packed backward bridge currently supports only cuda:0");
+    TORCH_CHECK(dcp.get_device() == 0, "packed backward bridge currently supports only cuda:0");
+
+    const auto rows = static_cast<int>(input.size(0));
+    const auto in_dim = static_cast<int>(input.size(1));
+    const auto out_dim = static_cast<int>(a_packed.size(1));
+
+    auto grad_input = torch::empty_like(input);
+    auto grad_a_packed = torch::empty_like(a_packed);
+
+    Qitnn_DeviceBackward3PackedEx(
+        input.data_ptr(),
+        tensor_dtype_code(input),
+        a_packed.data_ptr<float>(),
+        dcn.data_ptr<float>(),
+        dcz.data_ptr<float>(),
+        dcp.data_ptr<float>(),
+        grad_input.data_ptr(),
+        grad_a_packed.data_ptr<float>(),
+        rows,
+        in_dim,
+        out_dim
+    );
+
+    return {grad_input, grad_a_packed};
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> backnorm3_cuda(
@@ -464,6 +560,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("forward3_cuda", &forward3_cuda, "libQITNN forward3 (CUDA)");
+    m.def("forward3_packed_cuda", &forward3_packed_cuda, "libQITNN packed forward3 reference (CUDA)");
+    m.def("backward3_packed_cuda", &backward3_packed_cuda, "libQITNN packed backward3 reference (CUDA)");
     m.def("backnorm3_cuda", &backnorm3_cuda, "libQITNN backnorm3 (CUDA)");
     m.def("prior_cuda", &prior_cuda, "libQITNN prior (CUDA)");
     m.def("centered_simplex_cuda", &centered_simplex_cuda, "libQITNN centered simplex (CUDA)");

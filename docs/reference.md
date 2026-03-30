@@ -1363,8 +1363,9 @@ For training, remember to:
    explicitly checks `get_device() == 0` for every input. No multi-GPU support.
 
 2. **Mixed precision is conservative.** Canonical mixed mode is
-   `precision_mode="qts_fp32_rest_bf16"`. Legacy `mixed_precision=True`
-   still maps to the same path. This keeps QITNN master weights, Born
+   `precision_mode="qts_fp32_rest_bf16"`. Legacy `mixed_precision`
+   is still accepted only as a compatibility alias and resolves to the same
+   path. This keeps QITNN master weights, Born
    normalization, backnorm, entropy/prior, and the attention softmax path in
    `fp32` while allowing visible activations on the CUDA `bf16` path. Do not
    call `.half()` or `.bfloat16()` on the model itself.

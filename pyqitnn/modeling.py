@@ -93,26 +93,31 @@ class QITNNSimplexBlock(nn.Module):
         self.ff1 = QITNNLinear(self.hidden_dim, self.ffn_dim, ent_lambda=ent_lambda_ff, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
         self.ff2 = QITNNLinear(self.ff_visible_dim, self.proj_dim, ent_lambda=ent_lambda_ff, init_std=init_std, precision_mode=self.precision_mode, device=device, dtype=dtype)
 
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+    def _forward_attention(self, hidden: torch.Tensor) -> torch.Tensor:
         B, S, _ = hidden.shape
         hidden = _maybe_cast_activation(hidden, self.mixed_precision)
 
-        # self-attention
         norm = self.ln1(hidden)
         q = _unflatten(self.q_proj(_flatten(norm)), B, S)
         k = _unflatten(self.k_proj(_flatten(norm)), B, S)
         v = _unflatten(self.v_proj(_flatten(norm)), B, S)
         attn = attention2(q.contiguous(), k.contiguous(), v.contiguous(), mixed_precision=self.mixed_precision)
         hidden = hidden + _unflatten(self.o_proj(_flatten(attn)), B, S)
-        hidden = _maybe_cast_activation(hidden, self.mixed_precision)
+        return _maybe_cast_activation(hidden, self.mixed_precision)
 
-        # feedforward
+    def _forward_feedforward(self, hidden: torch.Tensor) -> torch.Tensor:
+        B, S, _ = hidden.shape
         ff_in = self.ln2(hidden)
         ff_mid = _unflatten(self.ff1(_flatten(ff_in)), B, S)
         ff_mid = simplex_gelu(ff_mid)
         hidden = hidden + _unflatten(self.ff2(_flatten(ff_mid)), B, S)
-        hidden = _maybe_cast_activation(hidden, self.mixed_precision)
-        return hidden
+        return _maybe_cast_activation(hidden, self.mixed_precision)
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self._forward_feedforward(self._forward_attention(hidden))
+
+    def forward_step(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self._forward_feedforward(self._forward_attention(hidden))
 
     def iter_qitnn_layers(self) -> Iterator[tuple[str, str, QITNNLinear]]:
         yield "q_proj", "qk", self.q_proj
@@ -185,36 +190,38 @@ class QITNNSimplexTransformerLM(nn.Module):
         if self.head.bias is not None:
             nn.init.zeros_(self.head.bias)
 
-    #====================
-    # forward
-    #====================
-
-    def forward(self, tokens: torch.Tensor, *, targets: torch.Tensor | None = None):
+    def _require_tokens(self, tokens: torch.Tensor) -> tuple[int, int]:
         if tokens.dim() != 2:
             raise RuntimeError("tokens must be [batch, seq]")
 
-        B, S = tokens.shape
-        if S > self.seq_len:
+        batch, seq = tokens.shape
+        if seq > self.seq_len:
             raise RuntimeError("sequence is longer than configured seq_len")
-        if self.mixed_precision:
-            if tokens.is_cuda and not torch.cuda.is_bf16_supported():
-                raise RuntimeError(
-                    f"precision_mode='{self.precision_mode}' currently targets CUDA bf16 visible activations. "
-                    "This GPU does not report bf16 support. "
-                    "Use precision_mode='fp32' to keep the trusted fp32 path."
-                )
-            if self.token_emb.weight.dtype != torch.float32 or self.pos_emb.dtype != torch.float32:
-                raise RuntimeError(
-                    f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
-                    "Do not call .half() or .bfloat16() on the model."
-                )
-            if self.head.weight.dtype != torch.float32 or (self.head.bias is not None and self.head.bias.dtype != torch.float32):
-                raise RuntimeError(
-                    f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
-                    "Do not call .half() or .bfloat16() on the model."
-                )
+        return batch, seq
 
-        amp_ctx = (
+    def _check_mixed_precision_contract(self, tokens: torch.Tensor) -> None:
+        if not self.mixed_precision:
+            return
+        if tokens.is_cuda and not torch.cuda.is_bf16_supported():
+            raise RuntimeError(
+                f"precision_mode='{self.precision_mode}' currently targets CUDA bf16 visible activations. "
+                "This GPU does not report bf16 support. "
+                "Use precision_mode='fp32' to keep the trusted fp32 path."
+            )
+        if self.token_emb.weight.dtype != torch.float32 or self.pos_emb.dtype != torch.float32:
+            raise RuntimeError(
+                f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
+                "Do not call .half() or .bfloat16() on the model."
+            )
+        if self.head.weight.dtype != torch.float32 or (self.head.bias is not None and self.head.bias.dtype != torch.float32):
+            raise RuntimeError(
+                f"precision_mode='{self.precision_mode}' expects fp32 master weights. "
+                "Do not call .half() or .bfloat16() on the model."
+            )
+
+    def _amp_context(self, tokens: torch.Tensor):
+        self._check_mixed_precision_contract(tokens)
+        return (
             torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True)
             if tokens.is_cuda and self.mixed_precision
             else (
@@ -223,19 +230,61 @@ class QITNNSimplexTransformerLM(nn.Module):
                 else nullcontext()
             )
         )
-        with amp_ctx:
-            hidden = self.token_emb(tokens) + self.pos_emb[:S].unsqueeze(0)
-            hidden = _maybe_cast_activation(hidden, self.mixed_precision)
-            for block in self.blocks:
-                hidden = block(hidden)
 
-            logits = self.head(self.ln_f(hidden))
+    def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        _, seq = self._require_tokens(tokens)
+        hidden = self.token_emb(tokens) + self.pos_emb[:seq].unsqueeze(0)
+        return _maybe_cast_activation(hidden, self.mixed_precision)
+
+    def _run_blocks(self, hidden: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            hidden = block(hidden)
+        return hidden
+
+    def _forward_hidden(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self._run_blocks(self._embed_tokens(tokens))
+
+    def _forward_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.head(self.ln_f(hidden))
+
+    def _forward_hidden_step(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden = self._embed_tokens(tokens)
+        for block in self.blocks:
+            hidden = block.forward_step(hidden)
+        return hidden[:, -1:, :].contiguous()
+
+    #====================
+    # forward
+    #====================
+
+    def forward(self, tokens: torch.Tensor, *, targets: torch.Tensor | None = None):
+        self._require_tokens(tokens)
+
+        with self._amp_context(tokens):
+            hidden = self._forward_hidden(tokens)
+            logits = self._forward_logits(hidden)
 
             loss = None
             if targets is not None:
                 loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
         return logits, loss
+
+    def forward_step(self, tokens: torch.Tensor) -> torch.Tensor:
+        _, seq = self._require_tokens(tokens)
+        if seq < 1:
+            raise RuntimeError("forward_step requires at least one token")
+        with self._amp_context(tokens):
+            return self._forward_hidden_step(tokens)
+
+    def decode_step(self, tokens: torch.Tensor) -> torch.Tensor:
+        _, seq = self._require_tokens(tokens)
+        if seq < 1:
+            raise RuntimeError("decode_step requires at least one token")
+        with self._amp_context(tokens):
+            hidden = self._forward_hidden_step(tokens)
+            logits = self._forward_logits(hidden)
+        return logits[:, -1, :].contiguous()
 
     #====================
     # QTS layer iteration
@@ -246,6 +295,10 @@ class QITNNSimplexTransformerLM(nn.Module):
             prefix = f"blocks.{idx}"
             for name, role, layer in block.iter_qitnn_layers():
                 yield f"{prefix}.{name}", role, layer
+
+    def _set_qitnn_runtime_backend(self, backend: str) -> None:
+        for _, _, layer in self.iter_qitnn_layers():
+            layer._set_runtime_backend(backend)
 
     #====================
     # optimizer param groups (SGD path)
@@ -383,8 +436,7 @@ class QITNNSimplexTransformerLM(nn.Module):
         out = tokens
         for _ in range(max_new_tokens):
             idx = out[:, -self.seq_len:]
-            logits, _ = self(idx)
-            nxt = logits[:, -1, :]
+            nxt = self.decode_step(idx)
 
             # mask non-printable bytes
             if ascii_guard:
