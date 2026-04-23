@@ -450,10 +450,6 @@ determinism, memory stability, and more.
 ## Links
 
 - [Full API Reference](https://github.com/kaifczxc-lab/PyQITNN/blob/SiritoriProjects/docs/reference.md)
-- [Basic QITNN Transformer](https://github.com/kaifczxc-lab/PyQITNN/blob/SiritoriProjects/BasicQITNN_Transformer.py)
-- [GitHub Repository](https://github.com/kaifczxc-lab/PyQITNN)
-- [QITNN Architecture Analysis](https://github.com/kaifczxc-lab/qitnn/blob/SiritoriProjects/Analysis-QITNN.md)
-- [Original Devlog (Discord, GPU Mode)](https://discord.com/channels/1189498204333543425/1466534042768904356/1476227907327098931)
 
 ---
 
