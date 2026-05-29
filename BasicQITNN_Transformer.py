@@ -64,7 +64,7 @@ class TrainConfig:
     # dataset: path to a text/json/jsonl file or a directory with such files
     # set this to your actual data path before running
     #====================
-    dataset: str | Path = r"D:\so_data\dearimgui_dataset.json"   # path to a file or directory with training data
+    dataset: str | Path = r"your_path"   # path to a file or directory with training data
     extended_dataset: bool = False   # True = use train_dir/val_dir/test_dir separately
     train_dir: str | Path | None = None
     val_dir: str | Path | None = None
