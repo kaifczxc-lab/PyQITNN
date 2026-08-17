@@ -7,6 +7,9 @@
 A PyTorch library implementing quantum-inspired ternary neural network layers.
 Runs on standard NVIDIA GPUs; no quantum hardware is required.
 
+This work was created while I was just learning and progressing (in writing documentation, design, some aspects in the code itself) in this area, which is why I used only AI in the code, now I am already working on https://github.com/kaifczxc-lab/OCSSN without using AI
+
+
 ```python
 import torch
 import pyqitnn
